@@ -1,0 +1,1 @@
+{"type": "FeatureCollection", "features": [{"type": "Feature", "geometry": {"type": "Point", "coordinates": [72.735, 20.05]}, "properties": {"name": "Community hall Talasari (seed)", "category": "community_poi", "amenity": "community_poi", "development_status": "existing", "source": "seed_demo"}}]}

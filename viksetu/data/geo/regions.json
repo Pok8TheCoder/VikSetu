@@ -1,0 +1,215 @@
+{
+  "district": {
+    "id": "palghar",
+    "name": "Palghar",
+    "name_mr": "पालघर",
+    "center": [
+      72.765,
+      19.697
+    ],
+    "talukas": [
+      {
+        "id": "jawhar",
+        "name": "Jawhar",
+        "name_mr": "जव्हार",
+        "centroid": [
+          73.9167,
+          19.9167
+        ]
+      },
+      {
+        "id": "mokhada",
+        "name": "Mokhada",
+        "name_mr": "मोखाडा",
+        "centroid": [
+          73.8333,
+          19.9667
+        ]
+      },
+      {
+        "id": "talasari",
+        "name": "Talasari",
+        "name_mr": "तलासरी",
+        "centroid": [
+          72.7333,
+          20.05
+        ]
+      },
+      {
+        "id": "vasai",
+        "name": "Vasai",
+        "name_mr": "वसई",
+        "centroid": [
+          72.8167,
+          19.47
+        ]
+      },
+      {
+        "id": "vikramgad",
+        "name": "Vikramgad",
+        "name_mr": "विक्रमगड",
+        "centroid": [
+          73.5833,
+          19.8333
+        ]
+      },
+      {
+        "id": "palghar",
+        "name": "Palghar",
+        "name_mr": "पालघर",
+        "centroid": [
+          72.765,
+          19.6967
+        ]
+      },
+      {
+        "id": "dahanu",
+        "name": "Dahanu",
+        "name_mr": "डहाणू",
+        "centroid": [
+          72.7333,
+          19.9667
+        ]
+      },
+      {
+        "id": "wada",
+        "name": "Wada",
+        "name_mr": "वाडा",
+        "centroid": [
+          73.1333,
+          19.65
+        ]
+      }
+    ],
+    "bbox": [
+      72.55,
+      19.35,
+      73.95,
+      20.15
+    ]
+  },
+  "talukas": [
+    {
+      "id": "jawhar",
+      "name": "Jawhar",
+      "name_mr": "जव्हार",
+      "centroid": [
+        73.9167,
+        19.9167
+      ],
+      "region_type": "taluka",
+      "development_notes": "Placeholder — link spend/works from pipeline.",
+      "shading_metric": null
+    },
+    {
+      "id": "mokhada",
+      "name": "Mokhada",
+      "name_mr": "मोखाडा",
+      "centroid": [
+        73.8333,
+        19.9667
+      ],
+      "region_type": "taluka",
+      "development_notes": "Placeholder — link spend/works from pipeline.",
+      "shading_metric": null
+    },
+    {
+      "id": "talasari",
+      "name": "Talasari",
+      "name_mr": "तलासरी",
+      "centroid": [
+        72.7333,
+        20.05
+      ],
+      "region_type": "taluka",
+      "development_notes": "Placeholder — link spend/works from pipeline.",
+      "shading_metric": null
+    },
+    {
+      "id": "vasai",
+      "name": "Vasai",
+      "name_mr": "वसई",
+      "centroid": [
+        72.8167,
+        19.47
+      ],
+      "region_type": "taluka",
+      "development_notes": "Placeholder — link spend/works from pipeline.",
+      "shading_metric": null
+    },
+    {
+      "id": "vikramgad",
+      "name": "Vikramgad",
+      "name_mr": "विक्रमगड",
+      "centroid": [
+        73.5833,
+        19.8333
+      ],
+      "region_type": "taluka",
+      "development_notes": "Placeholder — link spend/works from pipeline.",
+      "shading_metric": null
+    },
+    {
+      "id": "palghar",
+      "name": "Palghar",
+      "name_mr": "पालघर",
+      "centroid": [
+        72.765,
+        19.6967
+      ],
+      "region_type": "taluka",
+      "development_notes": "Placeholder — link spend/works from pipeline.",
+      "shading_metric": null
+    },
+    {
+      "id": "dahanu",
+      "name": "Dahanu",
+      "name_mr": "डहाणू",
+      "centroid": [
+        72.7333,
+        19.9667
+      ],
+      "region_type": "taluka",
+      "development_notes": "Placeholder — link spend/works from pipeline.",
+      "shading_metric": null
+    },
+    {
+      "id": "wada",
+      "name": "Wada",
+      "name_mr": "वाडा",
+      "centroid": [
+        73.1333,
+        19.65
+      ],
+      "region_type": "taluka",
+      "development_notes": "Placeholder — link spend/works from pipeline.",
+      "shading_metric": null
+    }
+  ],
+  "layers": {
+    "government_school": {
+      "label": "Schools (OSM)",
+      "color": "#2563eb"
+    },
+    "health_facility": {
+      "label": "Health facilities",
+      "color": "#dc2626"
+    },
+    "government_facility": {
+      "label": "Govt offices & public",
+      "color": "#7c3aed"
+    },
+    "community_poi": {
+      "label": "Community centres",
+      "color": "#059669"
+    },
+    "other_poi": {
+      "label": "Other POIs",
+      "color": "#64748b"
+    },
+    "development_ongoing": {
+      "label": "Ongoing (sample)",
+      "color": "#f59e0b"
+    }
+  }
+}

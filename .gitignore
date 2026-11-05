@@ -1,0 +1,14 @@
+node_modules/
+*.tsbuildinfo
+dist/
+.vite/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+Thumbs.db
+.env
+.env.*
+*.pem
+*.key
+credentials.json
