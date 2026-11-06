@@ -5,7 +5,7 @@ import json
 import re
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 GEO = ROOT / "data" / "geo"
 OVERRIDES = GEO / "poi_overrides.json"
 CARDS = GEO / "poi_cards.json"

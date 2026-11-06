@@ -16,10 +16,10 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 BACKEND_DIR = Path(__file__).resolve().parent
-ROOT = BACKEND_DIR.parents[2]
+ROOT = BACKEND_DIR.parents[1]
 GEO = ROOT / "data" / "geo"
 SPEND_CSV = ROOT / "data" / "palghar_2024_25" / "derived" / "ps_sector_spend_2024_25.csv"
-WORK = ROOT / "viksetu" / "agent_workspace"
+WORK = ROOT / "agent_workspace"
 INBOX = WORK / "inbox"
 SCRATCH = WORK / "scratch"
 INBOX.mkdir(parents=True, exist_ok=True)
@@ -45,7 +45,7 @@ app.add_middleware(
 
 def load_json(path: Path) -> dict:
     if not path.is_file():
-        raise HTTPException(404, f"Missing {path.name}. Run: python viksetu/scripts/fetch_geo.py")
+        raise HTTPException(404, f"Missing {path.name}. Run: python scripts/fetch_geo.py")
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -95,7 +95,7 @@ def regions():
 def geo_talukas():
     path = GEO / "talukas.geojson"
     if not path.is_file():
-        raise HTTPException(404, "Missing talukas.geojson. Run: python viksetu/scripts/fetch_talukas_and_pois.py")
+        raise HTTPException(404, "Missing talukas.geojson. Run: python scripts/fetch_talukas_and_pois.py")
     return talukas_for_map(load_json(path))
 
 
@@ -112,7 +112,7 @@ def geo_bbox():
     reg = load_json(GEO / "regions.json")
     bbox = reg.get("district", {}).get("bbox")
     if not bbox or len(bbox) != 4:
-        raise HTTPException(404, "No bbox. Run: python viksetu/scripts/compute_palghar_bbox.py")
+        raise HTTPException(404, "No bbox. Run: python scripts/compute_palghar_bbox.py")
     w, s, e, n = bbox
     return {
         "type": "FeatureCollection",
@@ -179,7 +179,7 @@ def _load_poi_cards_index() -> dict:
     if not POI_CARDS.is_file():
         raise HTTPException(
             404,
-            "Missing poi_cards.json. Run: python viksetu/scripts/build_poi_cards.py",
+            "Missing poi_cards.json. Run: python scripts/build_poi_cards.py",
         )
     data = json.loads(POI_CARDS.read_text(encoding="utf-8"))
     return data.get("pins") or {}
@@ -603,7 +603,7 @@ def canvas_file_raw(file_id: str):
 
 @app.post("/api/canvas/python")
 def canvas_python(req: PythonRequest):
-    """Run a script inside viksetu/agent_workspace (read/write anywhere under that folder)."""
+    """Run a script inside agent_workspace (read/write anywhere under that folder)."""
     return _run_python(req.code)
 
 
@@ -662,7 +662,7 @@ CANVAS_SYSTEM = (
     "hiddenPinSamples for pins on disabled layers (layerEnabled false), and the selected pin. "
     "Pin cards JSON has the full record for the selected pin and any pin the user named. "
     "Use map-layer, map-focus, and map-pin to change the live map without placing a new map shape. "
-    "Spend JSON is the real FY 2024-25 extract. Workspace files live in viksetu/agent_workspace (inbox/, scratch/, any path you create). "
+    "Spend JSON is the real FY 2024-25 extract. Workspace files live in agent_workspace (inbox/, scratch/, any path you create). "
     "Canvas file objects use type viksetu-file with fileId, fileKind (image|text|binary), and name. Drop images on the canvas like any file; "
     "when selected and the model supports vision, image bytes are sent automatically (not via chat). "
     "Reply with JSON only, keys in this order: {\"thinking\": string, \"reply\": string, \"actions\": array, \"continue\": boolean}. "

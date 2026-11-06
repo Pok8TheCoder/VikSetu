@@ -8,9 +8,9 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 GEO = ROOT / "data" / "geo"
-sys.path.insert(0, str(ROOT / "viksetu" / "backend"))
+sys.path.insert(0, str(ROOT / "backend"))
 
 from geo_utils import (  # noqa: E402
     enrich_poi_taluka,
