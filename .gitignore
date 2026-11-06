@@ -12,3 +12,27 @@ Thumbs.db
 *.pem
 *.key
 credentials.json
+
+# Local training lab (not part of VikSetu repo)
+/01_*.py
+/02_*.py
+/03_*.py
+/04_*.py
+/05_*.py
+/06_*.py
+/07_*.py
+/08_*.py
+/09_*.py
+/10_*.py
+/1llm.py
+/agent.py
+/check_setup.py
+/graph.py
+/store.py
+/tools.py
+/generate_viksetu_pdf.py
+/VIKSETU_5DAY_SPRINT.md
+/VIKSETU_IMPLEMENTATION_PLAN.md
+/VIKSETU_Project_Document_5Pages.pdf
+/images/
+/llm.py

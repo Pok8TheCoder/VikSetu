@@ -156,6 +156,10 @@ body {
   cursor: grabbing;
 }
 
+.layer-float--handed {
+  visibility: hidden;
+}
+
 .layer-float-head {
   display: flex;
   align-items: stretch;

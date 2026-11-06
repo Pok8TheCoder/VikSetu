@@ -99,8 +99,74 @@ export default function App() {
   const [messages, setMessages] = useState<{ role: string; text: string }[]>([]);
   const [loading, setLoading] = useState(true);
   const [layersOpen, setLayersOpen] = useState(true);
+  const [layersDetached, setLayersDetached] = useState(false);
+  const selectedPinRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    selectedPinRef.current = selectedCard?.pin_id ?? null;
+  }, [selectedCard]);
 
   const detailVisible = cardLoading || selectedCard !== null;
+  const layerItems = [
+    { id: "taluka_regions", label: "Taluka regions", color: "#94a3b8" },
+    ...LAYER_IDS.map((id) => ({
+      id,
+      label: id === "development" ? "Development / works" : regions?.layers[id]?.label ?? id,
+      color: CATEGORY_COLORS[id],
+    })),
+  ];
+
+  useEffect(() => {
+    if (!EMBED) return;
+    const onMessage = (event: MessageEvent) => {
+      const data = event.data as {
+        source?: string;
+        kind?: string;
+        layer?: string;
+        visible?: boolean;
+        pinId?: string;
+        lng?: number;
+        lat?: number;
+        zoom?: number;
+      };
+      if (!data || data.source !== "viksetu-canvas") return;
+      if (data.kind === "set-layer" && data.layer) {
+        setLayers((prev) => ({ ...prev, [data.layer as string]: Boolean(data.visible) }));
+        return;
+      }
+      if (data.kind === "focus-pin") {
+        const map = mapRef.current;
+        if (!map) return;
+        const zoom = typeof data.zoom === "number" ? data.zoom : 14;
+        if (data.pinId) {
+          for (const layerId of LAYER_IDS) {
+            const items = pinIndexRef.current[layerId] ?? [];
+            const hit = items.find((pin) => pin.pinId === data.pinId);
+            if (!hit) continue;
+            setLayers((prev) => ({ ...prev, [layerId]: true }));
+            map.flyTo({ center: [hit.lng, hit.lat], zoom });
+            void openPin(
+              { pin_id: hit.pinId, name: hit.name, taluka_id: hit.taluka },
+              layerId,
+              [hit.lng, hit.lat]
+            );
+            return;
+          }
+        }
+        if (typeof data.lng === "number" && typeof data.lat === "number") {
+          map.flyTo({ center: [data.lng, data.lat], zoom });
+        }
+        return;
+      }
+      if (data.kind === "refresh-pin" && data.pinId && selectedPinRef.current === data.pinId) {
+        void fetchPoiCard(data.pinId)
+          .then((card) => setSelectedCard(card))
+          .catch(() => undefined);
+      }
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [openPin]);
 
   const openPin = useCallback(async (
     props: Record<string, string | number | undefined>,
@@ -349,14 +415,32 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(LAYER_KEY, JSON.stringify(layers));
     if (!EMBED || loading) return;
-    const pins = Object.entries(pinIndexRef.current).flatMap(([layerId, items]) =>
-      layers[layerId] ? items : []
+    const layerStats = [
+      {
+        id: "taluka_regions",
+        enabled: !!layers.taluka_regions,
+        totalPins: 0,
+        visiblePins: 0,
+      },
+      ...LAYER_IDS.map((id) => {
+        const total = (pinIndexRef.current[id] ?? []).length;
+        const on = !!layers[id];
+        return { id, enabled: on, totalPins: total, visiblePins: on ? total : 0 };
+      }),
+    ];
+    const visiblePins = Object.entries(pinIndexRef.current).flatMap(([layerId, items]) =>
+      layers[layerId] ? items.map((pin) => ({ ...pin, layer: layerId, layerEnabled: true })) : []
+    );
+    const hiddenPinSamples = Object.entries(pinIndexRef.current).flatMap(([layerId, items]) =>
+      layers[layerId] ? [] : items.slice(0, 15).map((pin) => ({ ...pin, layer: layerId, layerEnabled: false }))
     );
     postMap({
       kind: "state",
       layers,
-      enabledCount: pins.length,
-      pins: pins.slice(0, 200),
+      enabledCount: visiblePins.length,
+      pins: visiblePins.slice(0, 200),
+      layerStats,
+      hiddenPinSamples: hiddenPinSamples.slice(0, 80),
     });
   }, [layers, loading]);
 
@@ -427,16 +511,23 @@ export default function App() {
           />
           <div ref={mapWrapRef} className="map-wrap">
             {loading && <div className="map-loading">Loading map…</div>}
-            <LayerIndexPanel
-              open={layersOpen}
-              onToggleOpen={() => setLayersOpen((o) => !o)}
-              layers={layers}
-              regions={regions}
-              layerIds={LAYER_IDS}
-              categoryColors={CATEGORY_COLORS}
-              onToggleLayer={(id) => toggleLayer(id as LayerId | "taluka_regions")}
-              boundsRef={mapWrapRef}
-            />
+            {!layersDetached && (
+              <LayerIndexPanel
+                open={layersOpen}
+                onToggleOpen={() => setLayersOpen((o) => !o)}
+                layers={layers}
+                regions={regions}
+                layerIds={LAYER_IDS}
+                categoryColors={CATEGORY_COLORS}
+                onToggleLayer={(id) => toggleLayer(id as LayerId | "taluka_regions")}
+                boundsRef={mapWrapRef}
+                allowDetach={EMBED}
+                onPull={(phase, x, y) => {
+                  postMap({ kind: "layers-drag", phase, x, y, open: layersOpen, layers, items: layerItems });
+                  if (phase === "end") setLayersDetached(true);
+                }}
+              />
+            )}
             <div ref={mapContainer} className="map" />
           </div>
         </div>

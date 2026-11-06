@@ -1,23 +1,7 @@
 """
-llm.py - minimal LLM client for Indus Training labs.
+Minimal LLM client for VikSetu (OpenAI-compatible /chat/completions).
 
-Backends (OpenAI-compatible /chat/completions):
-  textgen  text-generation-webui on localhost (default here)
-  ollama   local Ollama
-  gemini   Google Gemini (hosted)
-
-    set LLM_PROVIDER=textgen|ollama|gemini
-
-Environment variables
----------------------
-    LLM_PROVIDER       default "textgen"
-    TEXTGEN_BASE_URL   default "http://127.0.0.1:5000/v1"
-    TEXTGEN_MODEL      optional; else uses the model loaded in the UI
-    TEXTGEN_API_KEY    default "none"
-    OLLAMA_MODEL       default "llama3.2:3b"
-    OLLAMA_BASE        default "http://localhost:11434/v1"
-    GOOGLE_API_KEY     required for gemini
-    GEMINI_MODEL       default "gemini-2.0-flash"
+Backends: textgen, ollama, gemini — set LLM_PROVIDER.
 """
 
 import json
@@ -46,7 +30,7 @@ GEMINI_BASE = os.environ.get(
 )
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 
-DEFAULT_PROVIDER = os.environ.get("LLM_PROVIDER", "textgen").strip().lower()
+DEFAULT_PROVIDER = os.environ.get("LLM_PROVIDER", "gemini").strip().lower()
 
 _textgen_loaded_model = None
 _TOKENS_USED = 0
@@ -114,10 +98,7 @@ def _endpoint(provider):
         if not key:
             raise LLMError(
                 "GOOGLE_API_KEY is not set.\n"
-                "  1. Get a free key at https://aistudio.google.com/apikey\n"
-                "  2. Windows:  set GOOGLE_API_KEY=your_key_here\n"
-                "     mac/Linux: export GOOGLE_API_KEY=your_key_here\n"
-                "  Never paste the key into a .py file you will commit."
+                "  Get a key at https://aistudio.google.com/apikey and set GOOGLE_API_KEY."
             )
         return (
             GEMINI_BASE.rstrip("/") + "/chat/completions",
@@ -142,7 +123,6 @@ def chat(messages, provider=None, model=None, temperature=0.0,
     }
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
-    # text-generation-webui often 500s on response_format; prompt still asks for JSON.
     if json_mode and provider != "textgen":
         payload["response_format"] = {"type": "json_object"}
 
@@ -162,39 +142,17 @@ def chat(messages, provider=None, model=None, temperature=0.0,
             )
         elif e.code == 404:
             raise LLMError(
-                "%s has no model called %r (HTTP 404).\n"
-                "  textgen: load a model in the UI or set TEXTGEN_MODEL\n"
-                "  Ollama:  ollama pull %s\n%s"
-                % (provider, model, OLLAMA_MODEL, detail)
+                "%s has no model called %r (HTTP 404).\n%s"
+                % (provider, model, detail)
             )
         elif e.code == 429:
             raise LLMError(
-                "%s rate limit reached (HTTP 429). Wait a minute, or switch "
-                "provider with LLM_PROVIDER.\n%s" % (provider, detail)
+                "%s rate limit reached (HTTP 429).\n%s" % (provider, detail)
             )
         else:
             raise LLMError("%s returned HTTP %d.\n%s" % (provider, e.code, detail))
     except urllib.error.URLError as e:
-        if provider == "textgen":
-            raise LLMError(
-                "Cannot reach text-generation-webui at %s (%s).\n"
-                "  1. Is it running with the OpenAI API enabled (--api)?\n"
-                "  2. Is the default port 5000? Set TEXTGEN_BASE_URL if not.\n"
-                "  3. Or switch:  set LLM_PROVIDER=ollama  or  gemini"
-                % (TEXTGEN_BASE, e.reason)
-            )
-        if provider == "ollama":
-            raise LLMError(
-                "Cannot reach Ollama at %s (%s).\n"
-                "  1. Is it running?  ollama serve\n"
-                "  2. Model installed?  ollama pull %s\n"
-                "  3. Or switch:  set LLM_PROVIDER=textgen"
-                % (OLLAMA_BASE, e.reason, OLLAMA_MODEL)
-            )
-        raise LLMError(
-            "Cannot reach %s (%s). Check the network and the firewall."
-            % (provider, e.reason)
-        )
+        raise LLMError("Cannot reach %s (%s)." % (provider, e.reason))
 
     latency = time.time() - started
 
@@ -222,6 +180,63 @@ def chat(messages, provider=None, model=None, temperature=0.0,
             "total_tokens": usage.get("total_tokens"),
         },
         "raw": data,
+    }
+
+
+def chat_stream(messages, provider=None, model=None, temperature=0.0,
+                max_tokens=None, timeout=120):
+    provider = (provider or DEFAULT_PROVIDER).strip().lower()
+    url, headers, default_model = _endpoint(provider)
+    model = model or default_model
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "stream": True,
+    }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), method="POST")
+    req.add_header("Content-Type", "application/json")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:600]
+        raise LLMError("%s returned HTTP %d.\n%s" % (provider, e.code, detail))
+    except urllib.error.URLError as e:
+        raise LLMError("Cannot reach %s (%s). Is it running?" % (provider, e.reason))
+
+    parts = []
+    model_name = model
+    with resp:
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            body = line[5:].strip()
+            if body == "[DONE]":
+                break
+            try:
+                obj = json.loads(body)
+            except json.JSONDecodeError:
+                continue
+            model_name = obj.get("model") or model_name
+            choices = obj.get("choices") or []
+            if not choices:
+                continue
+            delta = (choices[0].get("delta") or {}).get("content") or ""
+            if delta:
+                parts.append(delta)
+                yield {"delta": delta}
+    yield {
+        "done": True,
+        "text": "".join(parts).strip(),
+        "provider": provider,
+        "model": model_name,
     }
 
 
@@ -254,26 +269,61 @@ def ask_json(prompt, system=None, attempts=3, **kwargs):
             if attempt == attempts:
                 break
     raise LLMError(
-        "Model did not return valid JSON after %d attempts.\n"
-        "Last reply was:\n%s" % (attempts, last[:600])
+        "Model did not return valid JSON after %d attempts.\nLast reply was:\n%s"
+        % (attempts, last[:600])
     )
 
 
-def run(main_fn):
-    try:
-        main_fn()
-    except LLMError as e:
-        print()
-        print("-" * 64)
-        print("SETUP PROBLEM - the code is fine, the backend is not reachable")
-        print("-" * 64)
-        print(str(e))
-        print("-" * 64)
-        print("For a full diagnosis run:  python check_setup.py")
-        sys.exit(1)
-    except KeyboardInterrupt:
-        print("\nStopped.")
-        sys.exit(130)
+VISION_SUBSTRINGS = (
+    "vl",
+    "vision",
+    "llava",
+    "gemini",
+    "gpt-4o",
+    "gpt-4.1",
+    "gpt-5",
+    "claude-3",
+    "pixtral",
+    "qwen2-vl",
+    "qwen3-vl",
+    "internvl",
+    "minicpm-v",
+)
+
+
+def resolve_model(provider=None, model=None):
+    provider = (provider or DEFAULT_PROVIDER).strip().lower()
+    _, _, default_model = _endpoint(provider)
+    return provider, model or default_model
+
+
+def supports_vision(provider=None, model=None):
+    provider, name = resolve_model(provider, model)
+    lowered = (name or "").lower()
+    if provider == "gemini":
+        return True
+    return any(token in lowered for token in VISION_SUBSTRINGS)
+
+
+def normalize_image_data_url(url_or_b64):
+    text = (url_or_b64 or "").strip()
+    if not text:
+        return ""
+    if text.startswith("data:"):
+        return text
+    return "data:image/png;base64," + text
+
+
+def user_message_content(text, images=None, vision=False):
+    body = text or ""
+    imgs = [normalize_image_data_url(item) for item in (images or []) if item]
+    imgs = [item for item in imgs if item]
+    if not imgs or not vision:
+        return body
+    parts = [{"type": "text", "text": body}]
+    for url in imgs[:4]:
+        parts.append({"type": "image_url", "image_url": {"url": url}})
+    return parts
 
 
 def which():
@@ -287,8 +337,3 @@ def which():
         GEMINI_MODEL,
         "set" if os.environ.get("GOOGLE_API_KEY") else "MISSING",
     )
-
-
-if __name__ == "__main__":
-    print("Active backend:", which())
-    print("Reply:", ask("Reply with exactly the word: ready"))

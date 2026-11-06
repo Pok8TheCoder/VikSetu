@@ -5,6 +5,15 @@ export type MapPinBrief = {
   lng: number;
   lat: number;
   taluka?: string;
+  layer?: string;
+  layerEnabled?: boolean;
+};
+
+export type MapLayerStat = {
+  id: string;
+  enabled: boolean;
+  totalPins: number;
+  visiblePins: number;
 };
 
 export type SelectedPin = {
@@ -20,11 +29,20 @@ export type SelectedPin = {
 export type MapContext = {
   layers: Record<string, boolean>;
   pins: MapPinBrief[];
+  hiddenPinSamples: MapPinBrief[];
+  layerStats: MapLayerStat[];
   enabledCount: number;
   selected: SelectedPin | null;
 };
 
-let state: MapContext = { layers: {}, pins: [], enabledCount: 0, selected: null };
+let state: MapContext = {
+  layers: {},
+  pins: [],
+  hiddenPinSamples: [],
+  layerStats: [],
+  enabledCount: 0,
+  selected: null,
+};
 let listening = false;
 
 export function getMapContext(): MapContext {
@@ -40,6 +58,8 @@ export function watchMapContext() {
       kind?: string;
       layers?: Record<string, boolean>;
       pins?: MapPinBrief[];
+      hiddenPinSamples?: MapPinBrief[];
+      layerStats?: MapLayerStat[];
       enabledCount?: number;
       pinId?: string;
       name?: string;
@@ -52,10 +72,14 @@ export function watchMapContext() {
     if (!data || data.source !== "viksetu-map") return;
     if (data.kind === "state") {
       const pins = Array.isArray(data.pins) ? data.pins : [];
+      const hiddenPinSamples = Array.isArray(data.hiddenPinSamples) ? data.hiddenPinSamples : [];
+      const layerStats = Array.isArray(data.layerStats) ? data.layerStats : [];
       state = {
         ...state,
         layers: data.layers ?? {},
         pins,
+        hiddenPinSamples,
+        layerStats,
         enabledCount: data.enabledCount ?? pins.length,
       };
     }

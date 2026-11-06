@@ -1,5 +1,7 @@
 import { createShapeId, toRichText, type TLShapeId } from "@tldraw/tlschema";
 import type { Editor } from "@tldraw/editor";
+import { getCursorPoint } from "./cursor";
+import { CUSTOM_TYPE } from "./CustomShape";
 import { CHART_TYPE, DOC_TYPE, FILE_TYPE, SHEET_TYPE } from "./embedShapes";
 import { MAP_TYPE } from "./MapShape";
 
@@ -12,6 +14,9 @@ export type CanvasShape = {
   h: number;
   text: string;
   detail: string;
+  selected: boolean;
+  fileId?: string;
+  fileKind?: string;
 };
 
 export type CanvasAction =
@@ -63,13 +68,44 @@ export type CanvasAction =
       h?: number;
     }
   | { op: "file"; x?: number; y?: number; w?: number; h?: number }
+  | {
+      op: "embed";
+      id?: string;
+      title?: string;
+      html?: string;
+      data?: unknown;
+      x?: number;
+      y?: number;
+      w?: number;
+      h?: number;
+    }
   | { op: "delete"; ids: string[] }
-  | { op: "zoom" };
+  | { op: "zoom" }
+  | { op: "map-layer"; layer: string; visible: boolean }
+  | { op: "map-focus"; pinId?: string; lng?: number; lat?: number; zoom?: number }
+  | { op: "map-pin"; pinId: string; name?: string; description?: string; agent_summary?: string };
+
+export type PythonNote = { ok?: boolean; stdout?: string; stderr?: string; code?: number; script?: string };
+
+export type FileToolNote = {
+  ok?: boolean;
+  op?: string;
+  mode?: string;
+  path?: string;
+  error?: string;
+  text?: string;
+  dump?: string;
+  preview?: string;
+};
 
 export type AgentTurn = {
   reply: string;
   actions: CanvasAction[];
   fromModel?: boolean;
+  thinking?: string;
+  continue?: boolean;
+  python?: PythonNote[];
+  file_tools?: FileToolNote[];
 };
 
 const GEOS = new Set(["rectangle", "ellipse", "diamond", "triangle", "hexagon"]);
@@ -108,6 +144,7 @@ function shapeText(shape: { type: string; props: Record<string, unknown> }): str
   if (shape.type === DOC_TYPE) return String(shape.props.title || "Note");
   if (shape.type === SHEET_TYPE) return String(shape.props.title || "Sheet");
   if (shape.type === FILE_TYPE) return String(shape.props.name || "File drop");
+  if (shape.type === CUSTOM_TYPE) return String(shape.props.title || "Embed");
   return plainText(shape);
 }
 
@@ -116,12 +153,14 @@ function shapeDetail(shape: { type: string; props: Record<string, unknown> }): s
   if (shape.type === CHART_TYPE) return clip(`${props.chart} labels ${props.labels} values ${props.values}`);
   if (shape.type === DOC_TYPE) return clip(String(props.body || ""));
   if (shape.type === SHEET_TYPE) return clip(`columns ${props.columns} rows ${props.rows}`, 900);
-  if (shape.type === FILE_TYPE) return clip(`file ${props.fileId} ${props.preview}`);
+  if (shape.type === FILE_TYPE) return clip(`file ${props.fileId} kind ${props.kind ?? ""} ${props.preview}`);
   if (shape.type === MAP_TYPE) return "Live Palghar map";
+  if (shape.type === CUSTOM_TYPE) return clip(`custom embed data ${props.data} html ${props.html}`, 2500);
   return "";
 }
 
 export function snapshotCanvas(editor: Editor): CanvasShape[] {
+  const selected = new Set(editor.getSelectedShapeIds());
   return editor.getCurrentPageShapes().map((shape) => {
     const props = shape.props as Record<string, unknown>;
     const bounds = editor.getShapePageBounds(shape);
@@ -135,8 +174,70 @@ export function snapshotCanvas(editor: Editor): CanvasShape[] {
       h: Math.round(bounds?.h ?? Number(props.h ?? 0)),
       text: shapeText(record),
       detail: shapeDetail(record),
+      selected: selected.has(shape.id),
+      fileId: shape.type === FILE_TYPE ? String(props.fileId ?? "") : undefined,
+      fileKind: shape.type === FILE_TYPE ? String(props.kind ?? "") : undefined,
     };
   });
+}
+
+function numeric(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const text = String(value ?? "")
+    .replace(/[₹,\s]/g, "")
+    .replace(/(crore|cr|lakh|lac)$/i, "");
+  const amount = Number(text);
+  return Number.isFinite(amount) ? amount : 0;
+}
+
+function asList(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== "string" || !value.trim()) return [];
+  try {
+    const parsed = JSON.parse(value);
+    if (Array.isArray(parsed)) return parsed;
+  } catch {
+    // Fall through to a comma or newline split.
+  }
+  return value
+    .split(/[,|\n]/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function chartSeries(action: CanvasAction): { labels: string[]; values: number[] } {
+  const raw = action as CanvasAction & Record<string, unknown>;
+  const bundled = asList(raw.series ?? raw.data ?? raw.points ?? raw.items);
+  let labels = asList(raw.labels).map((item) => {
+    if (item && typeof item === "object") {
+      const row = item as Record<string, unknown>;
+      return String(row.label ?? row.name ?? row.sector ?? row.category ?? "");
+    }
+    return String(item ?? "");
+  });
+  let values = asList(raw.values).map((item) => {
+    if (item && typeof item === "object") {
+      const row = item as Record<string, unknown>;
+      return numeric(row.value ?? row.amount ?? row.y ?? row.actual_spend_inr ?? row.spend);
+    }
+    return numeric(item);
+  });
+  const bundledHasNumbers = bundled.some((item) => item && typeof item === "object");
+  if (bundledHasNumbers && (!values.some((value) => value !== 0) || labels.length === 0)) {
+    labels = bundled.map((item) => {
+      const row = (item ?? {}) as Record<string, unknown>;
+      return String(row.label ?? row.name ?? row.sector ?? row.category ?? "");
+    });
+    values = bundled.map((item) => {
+      const row = (item ?? {}) as Record<string, unknown>;
+      return numeric(row.value ?? row.amount ?? row.y ?? row.actual_spend_inr ?? row.spend);
+    });
+  }
+  const count = Math.max(labels.length, values.length);
+  return {
+    labels: Array.from({ length: count }, (_, index) => labels[index] || String(index + 1)),
+    values: Array.from({ length: count }, (_, index) => values[index] ?? 0),
+  };
 }
 
 function resolveId(ref: string, created: TLShapeId[], existing: CanvasShape[]): TLShapeId | null {
@@ -151,8 +252,62 @@ function resolveId(ref: string, created: TLShapeId[], existing: CanvasShape[]): 
   return (byText?.id as TLShapeId) ?? null;
 }
 
-export function applyActions(editor: Editor, actions: CanvasAction[], existing: CanvasShape[]) {
+export function ensureRequested(message: string, actions: CanvasAction[]): CanvasAction[] {
+  const lower = message.toLowerCase();
+  const updating = /\b(update|change|edit|fix|format|resize|move)\b/.test(lower);
+  const placing = /\b(place|add|create|put|make|draw|embed|insert|another|new)\b/.test(lower);
+  const asking = /^\s*(what|which|how|why|who|where|when|is|are|does|do|can you (tell|explain))\b/.test(lower);
+  if (actions.some((action) => action.op === "embed")) return actions;
+  if (updating && !placing) return actions;
+  if (asking && !placing) return actions;
+  if (!placing && !/\b(chart|graph|sheet|note)\b/.test(lower)) return actions;
+  const next = [...actions];
+  const want: { test: RegExp; action: CanvasAction }[] = [
+    { test: /\b(chart|graph)\b/, action: { op: "chart", title: "Chart", chart: "bar", labels: [], values: [] } },
+    { test: /\b(spreadsheet|sheet|table)\b/, action: { op: "sheet", title: "Sheet", columns: ["Item", "Value"], rows: [["", ""]] } },
+    { test: /\b(markdown|\.md\b|\bnote\b|document)\b/, action: { op: "doc", title: "Note", format: "md", body: "" } },
+    { test: /\b(file drop|file node)\b/, action: { op: "file" } },
+  ];
+  const satisfiedBy: Record<string, string[]> = {
+    chart: ["chart", "embed"],
+    sheet: ["sheet", "embed"],
+    doc: ["doc", "text", "geo", "embed"],
+    file: ["file"],
+  };
+  for (const item of want) {
+    if (!item.test.test(lower)) continue;
+    const accepted = satisfiedBy[item.action.op] ?? [item.action.op];
+    if (next.some((action) => accepted.includes(action.op))) continue;
+    next.push(item.action);
+  }
+  return next;
+}
+
+export function applyActions(
+  editor: Editor,
+  actions: CanvasAction[],
+  existing: CanvasShape[],
+  placedBefore = 0
+): { created: string[]; placed: number } {
   const created: TLShapeId[] = [];
+  const origin = getCursorPoint(editor);
+  let placed = placedBefore;
+  const mapOnPage = existing.find((shape) => shape.type === MAP_TYPE);
+  let usedMapSide = false;
+  const dropAt = (kind?: string) => {
+    const beside =
+      mapOnPage &&
+      !usedMapSide &&
+      (kind === "chart" || kind === "doc" || kind === "sheet" || kind === "embed");
+    if (beside) {
+      usedMapSide = true;
+      placed += 1;
+      return { x: mapOnPage.x + mapOnPage.w + 48, y: mapOnPage.y };
+    }
+    const point = { x: origin.x + placed * 320, y: origin.y + 28 + placed * 48 };
+    placed += 1;
+    return point;
+  };
   editor.run(() => {
     for (const action of actions) {
       if (action.op === "geo") {
@@ -173,11 +328,12 @@ export function applyActions(editor: Editor, actions: CanvasAction[], existing: 
           | "orange"
           | "green"
           | "red";
+        const spot = dropAt("geo");
         editor.createShape({
           id,
           type: "geo",
-          x: action.x ?? 80 + created.length * 40,
-          y: action.y ?? 80 + created.length * 28,
+          x: spot.x,
+          y: spot.y,
           props: {
             geo,
             w: action.w ?? 200,
@@ -200,11 +356,12 @@ export function applyActions(editor: Editor, actions: CanvasAction[], existing: 
           | "orange"
           | "green"
           | "red";
+        const spot = dropAt("text");
         editor.createShape({
           id,
           type: "text",
-          x: action.x ?? 120,
-          y: action.y ?? 120,
+          x: spot.x,
+          y: spot.y,
           props: {
             color,
             richText: toRichText(action.text || ""),
@@ -212,12 +369,13 @@ export function applyActions(editor: Editor, actions: CanvasAction[], existing: 
         });
         created.push(id);
       } else if (action.op === "map") {
+        const spot = dropAt("map");
         const id = createShapeId();
         editor.createShape({
           id,
           type: MAP_TYPE,
-          x: action.x ?? 80,
-          y: action.y ?? 72,
+          x: spot.x,
+          y: spot.y,
           props: {
             w: action.w ?? 760,
             h: action.h ?? 520,
@@ -225,20 +383,22 @@ export function applyActions(editor: Editor, actions: CanvasAction[], existing: 
         });
         created.push(id);
       } else if (action.op === "chart") {
+        const series = chartSeries(action);
         const props = {
-          w: action.w ?? 420,
-          h: action.h ?? 280,
+          w: Math.max(action.w ?? 480, 480),
+          h: Math.max(action.h ?? 320, 320),
           title: action.title || "Chart",
           chart: action.chart === "line" || action.chart === "pie" ? action.chart : "bar",
-          labels: JSON.stringify(action.labels ?? []),
-          values: JSON.stringify((action.values ?? []).map((value) => Number(value) || 0)),
+          labels: JSON.stringify(series.labels),
+          values: JSON.stringify(series.values),
         };
         const existingId = action.id ? resolveId(action.id, created, existing) : null;
         if (existingId) {
           editor.updateShape({ id: existingId, type: CHART_TYPE, props });
         } else {
+          const spot = dropAt("chart");
           const id = createShapeId();
-          editor.createShape({ id, type: CHART_TYPE, x: action.x ?? 80, y: action.y ?? 80, props });
+          editor.createShape({ id, type: CHART_TYPE, x: spot.x, y: spot.y, props });
           created.push(id);
         }
       } else if (action.op === "doc") {
@@ -253,8 +413,9 @@ export function applyActions(editor: Editor, actions: CanvasAction[], existing: 
         if (existingId) {
           editor.updateShape({ id: existingId, type: DOC_TYPE, props });
         } else {
+          const spot = dropAt("doc");
           const id = createShapeId();
-          editor.createShape({ id, type: DOC_TYPE, x: action.x ?? 80, y: action.y ?? 80, props });
+          editor.createShape({ id, type: DOC_TYPE, x: spot.x, y: spot.y, props });
           created.push(id);
         }
       } else if (action.op === "sheet") {
@@ -273,18 +434,49 @@ export function applyActions(editor: Editor, actions: CanvasAction[], existing: 
         if (existingId) {
           editor.updateShape({ id: existingId, type: SHEET_TYPE, props });
         } else {
+          const spot = dropAt("sheet");
           const id = createShapeId();
-          editor.createShape({ id, type: SHEET_TYPE, x: action.x ?? 80, y: action.y ?? 80, props });
+          editor.createShape({ id, type: SHEET_TYPE, x: spot.x, y: spot.y, props });
+          created.push(id);
+        }
+      } else if (action.op === "embed") {
+        const dataText =
+          action.data === undefined || action.data === null
+            ? ""
+            : typeof action.data === "string"
+              ? action.data
+              : JSON.stringify(action.data);
+        const props = {
+          w: Math.min(Math.max(action.w ?? 420, 280), 1200),
+          h: Math.min(Math.max(action.h ?? 300, 200), 900),
+          title: action.title || "Embed",
+          html: String(action.html ?? "").slice(0, 60000),
+          data: dataText.slice(0, 60000),
+        };
+        const existingId = action.id ? resolveId(action.id, created, existing) : null;
+        if (existingId) {
+          const patch: Record<string, unknown> = { ...props };
+          if (action.w === undefined) delete patch.w;
+          if (action.h === undefined) delete patch.h;
+          if (action.title === undefined) delete patch.title;
+          if (action.html === undefined) delete patch.html;
+          if (action.data === undefined) delete patch.data;
+          editor.updateShape({ id: existingId, type: CUSTOM_TYPE, props: patch });
+        } else {
+          const spot = dropAt("embed");
+          const id = createShapeId();
+          editor.createShape({ id, type: CUSTOM_TYPE, x: spot.x, y: spot.y, props });
           created.push(id);
         }
       } else if (action.op === "file") {
+        const spot = dropAt("file");
         const id = createShapeId();
         editor.createShape({
           id,
           type: FILE_TYPE,
-          x: action.x ?? 80,
-          y: action.y ?? 80,
-          props: { w: action.w ?? 300, h: action.h ?? 220, name: "", fileId: "", preview: "" },
+          x: spot.x,
+          y: spot.y,
+          props: { w: action.w ?? 300, h: action.h ?? 220, name: "", fileId: "", preview: "", uploadPct: 100 },
         });
         created.push(id);
       } else if (action.op === "arrow") {
@@ -316,6 +508,10 @@ export function applyActions(editor: Editor, actions: CanvasAction[], existing: 
       }
     }
   });
+  return {
+    created: created.map((id) => `${editor.getShape(id)?.type ?? "shape"} ${id}`),
+    placed,
+  };
 }
 
 export function planLocally(message: string, canvas: CanvasShape[]): AgentTurn {

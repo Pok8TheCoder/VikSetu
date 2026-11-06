@@ -1,4 +1,11 @@
-import type { PointerEvent as ReactPointerEvent } from "react";
+import {
+  useEffect,
+  useId,
+  useState,
+  type DragEvent as ReactDragEvent,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+} from "react";
 import {
   BaseBoxShapeUtil,
   HTMLContainer,
@@ -7,6 +14,7 @@ import {
   type Editor,
   type TLShape,
   type TLShapeId,
+  type TLShapePartial,
 } from "tldraw";
 
 export const CHART_TYPE = "viksetu-chart";
@@ -19,7 +27,7 @@ declare module "@tldraw/tlschema" {
     "viksetu-chart": { w: number; h: number; title: string; chart: string; labels: string; values: string };
     "viksetu-doc": { w: number; h: number; title: string; format: string; body: string };
     "viksetu-sheet": { w: number; h: number; title: string; columns: string; rows: string };
-    "viksetu-file": { w: number; h: number; name: string; fileId: string; preview: string };
+    "viksetu-file": { w: number; h: number; name: string; fileId: string; preview: string; uploadPct: number; kind: string };
   }
 }
 
@@ -28,25 +36,56 @@ type DocShape = TLShape<typeof DOC_TYPE>;
 type SheetShape = TLShape<typeof SHEET_TYPE>;
 type FileShape = TLShape<typeof FILE_TYPE>;
 
-function startDrag(
+export function useAccelHeld() {
+  const [held, setHeld] = useState(false);
+  useEffect(() => {
+    const sync = (event: KeyboardEvent) => setHeld(event.ctrlKey || event.metaKey);
+    const clear = () => setHeld(false);
+    window.addEventListener("keydown", sync);
+    window.addEventListener("keyup", sync);
+    window.addEventListener("blur", clear);
+    return () => {
+      window.removeEventListener("keydown", sync);
+      window.removeEventListener("keyup", sync);
+      window.removeEventListener("blur", clear);
+    };
+  }, []);
+  return held;
+}
+
+export function keepInteractive(event: ReactPointerEvent) {
+  if (event.ctrlKey || event.metaKey) return;
+  stopEventPropagation(event);
+}
+
+export function startShapeDrag(
   editor: Editor,
   shape: { id: TLShapeId; type: string; x: number; y: number },
-  event: ReactPointerEvent<HTMLDivElement>
+  event: ReactPointerEvent<HTMLElement>
 ) {
-  if (event.button !== 0) return;
+  if (event.button !== 0 || event.ctrlKey || event.metaKey) return;
   stopEventPropagation(event);
   event.preventDefault();
-  editor.setSelectedShapes([shape.id]);
+  const selected = editor.getSelectedShapeIds();
+  const group = selected.includes(shape.id) && selected.length > 1;
+  const moving = (group ? selected : [shape.id])
+    .map((id) => editor.getShape(id))
+    .filter((item): item is NonNullable<typeof item> => Boolean(item))
+    .map((item) => ({ id: item.id, type: item.type, x: item.x, y: item.y }));
+  if (!group) editor.setSelectedShapes([shape.id]);
   const origin = editor.screenToPage({ x: event.clientX, y: event.clientY });
-  const start = { x: shape.x, y: shape.y, px: origin.x, py: origin.y };
   const move = (ev: PointerEvent | MouseEvent) => {
     const page = editor.screenToPage({ x: ev.clientX, y: ev.clientY });
-    editor.updateShape({
-      id: shape.id,
-      type: shape.type,
-      x: start.x + (page.x - start.px),
-      y: start.y + (page.y - start.py),
-    } as Parameters<Editor["updateShapes"]>[0][number]);
+    const dx = page.x - origin.x;
+    const dy = page.y - origin.y;
+    editor.updateShapes(
+      moving.map((item) => ({
+        id: item.id,
+        type: item.type,
+        x: item.x + dx,
+        y: item.y + dy,
+      })) as TLShapePartial[]
+    );
   };
   const up = () => {
     window.removeEventListener("pointermove", move);
@@ -84,9 +123,28 @@ function parseRows(raw: string): string[][] {
   }
 }
 
+function formatTick(value: number): string {
+  const abs = Math.abs(value);
+  const sign = value < 0 ? "-" : "";
+  const compact = (amount: number) => String(Math.round(amount * 10) / 10);
+  if (abs >= 1e7) return `${sign}${compact(abs / 1e7)} Cr`;
+  if (abs >= 1e5) return `${sign}${compact(abs / 1e5)} L`;
+  if (abs >= 1000) return `${sign}${compact(abs / 1000)}k`;
+  if (Number.isInteger(value)) return String(value);
+  return `${sign}${compact(abs)}`;
+}
+
+function axisTop(max: number): number {
+  if (!(max > 0)) return 1;
+  const power = 10 ** Math.floor(Math.log10(max));
+  const fraction = max / power;
+  const nice = fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 2.5 ? 2.5 : fraction <= 5 ? 5 : 10;
+  return nice * power;
+}
+
 function ChartGraphic({ chart, labels, values }: { chart: string; labels: string[]; values: number[] }) {
+  const fillId = `vik-bar-${useId().replace(/:/g, "")}`;
   if (!values.length) return <p className="vik-empty">No series yet. Ask the agent to chart data.</p>;
-  const max = Math.max(...values, 1);
   if (chart === "pie") {
     let cursor = 0;
     const total = values.reduce((sum, value) => sum + Math.max(value, 0), 0) || 1;
@@ -111,64 +169,203 @@ function ChartGraphic({ chart, labels, values }: { chart: string; labels: string
       </div>
     );
   }
-  if (chart === "line") {
-    const points = values
-      .map((value, index) => {
-        const x = values.length === 1 ? 50 : (index / (values.length - 1)) * 100;
-        const y = 100 - (value / max) * 100;
-        return `${x},${y}`;
-      })
-      .join(" ");
-    return (
-      <svg className="vik-chart-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
-        <polyline fill="none" stroke="#38bdf8" strokeWidth="2" points={points} />
-      </svg>
-    );
-  }
-  return (
-    <div className="vik-bars">
-      {values.map((value, index) => (
-        <div key={labels[index] ?? index} className="vik-bar-col">
-          <div className="vik-bar" style={{ height: `${Math.max(4, (value / max) * 100)}%` }} />
-          <span>{labels[index] ?? index + 1}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
 
-function DocBody({ format, body }: { format: string; body: string }) {
-  if (!body.trim()) return <p className="vik-empty">Empty note.</p>;
+  const width = 640;
+  const height = 400;
+  const left = 68;
+  const right = 16;
+  const top = 16;
+  const bottom = 108;
+  const plotW = width - left - right;
+  const plotH = height - top - bottom;
+  const scaleMax = axisTop(Math.max(...values, 0));
+  const ticks = [0, 1, 2, 3, 4].map((step) => (scaleMax * step) / 4);
+  const baseline = top + plotH;
+  const yOf = (value: number) => baseline - (Math.max(value, 0) / scaleMax) * plotH;
+  const slot = plotW / Math.max(values.length, 1);
+
   return (
-    <div className="vik-doc-body">
-      {body.split("\n").map((line, index) => {
-        if (format === "md" && line.startsWith("# ")) return <h3 key={index}>{line.slice(2)}</h3>;
-        if (format === "md" && line.startsWith("## ")) return <h4 key={index}>{line.slice(3)}</h4>;
-        if (format === "md" && (line.startsWith("- ") || line.startsWith("* "))) return <li key={index}>{line.slice(2)}</li>;
-        return <p key={index}>{line || "\u00a0"}</p>;
+    <svg className="vik-chart-svg" viewBox={`0 0 ${width} ${height}`} role="img">
+      <defs>
+        <linearGradient id={fillId} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#7dd3fc" />
+          <stop offset="100%" stopColor="#2563eb" />
+        </linearGradient>
+      </defs>
+      {ticks.map((tick) => {
+        const y = yOf(tick);
+        return (
+          <g key={tick}>
+            {tick > 0 && <line className="vik-chart-grid" x1={left} x2={left + plotW} y1={y} y2={y} />}
+            <text className="vik-chart-tick" x={left - 8} y={y + 4} textAnchor="end">
+              {formatTick(tick)}
+            </text>
+          </g>
+        );
       })}
+      <line className="vik-chart-axis" x1={left} y1={top} x2={left} y2={baseline} />
+      <line className="vik-chart-axis" x1={left} y1={baseline} x2={left + plotW} y2={baseline} />
+      {chart === "line" ? (
+        <polyline
+          fill="none"
+          stroke="#38bdf8"
+          strokeWidth="2.5"
+          strokeLinejoin="round"
+          strokeLinecap="round"
+          points={values
+            .map((value, index) => `${left + slot * index + slot / 2},${yOf(value)}`)
+            .join(" ")}
+        />
+      ) : (
+        values.map((value, index) => {
+          const barW = Math.min(42, slot * 0.62);
+          const x = left + slot * index + (slot - barW) / 2;
+          const y = yOf(value);
+          return (
+            <rect
+              key={index}
+              x={x}
+              y={y}
+              width={barW}
+              height={Math.max(baseline - y, value > 0 ? 1.5 : 0)}
+              rx="3"
+              fill={`url(#${fillId})`}
+            />
+          );
+        })
+      )}
+      {values.map((_, index) => {
+        const x = left + slot * index + slot / 2;
+        const label = labels[index] ?? String(index + 1);
+        const y = baseline + 16;
+        return (
+          <text
+            key={`${label}-${index}`}
+            className="vik-chart-label"
+            x={x}
+            y={y}
+            textAnchor="end"
+            transform={`rotate(-42 ${x} ${y})`}
+          >
+            <title>{label}</title>
+            {label}
+          </text>
+        );
+      })}
+    </svg>
+  );
+}
+
+function DocBody({ body, onChange }: { body: string; onChange: (value: string) => void }) {
+  return (
+    <textarea
+      className="vik-doc-edit"
+      value={body}
+      placeholder="Write here. The agent can edit this too."
+      onPointerDown={stopEventPropagation}
+      onChange={(event) => onChange(event.target.value)}
+    />
+  );
+}
+
+function ChartDataEditor({
+  labels,
+  values,
+  onChange,
+}: {
+  labels: string[];
+  values: number[];
+  onChange: (labels: string[], values: number[]) => void;
+}) {
+  const count = Math.max(labels.length, values.length, 1);
+  const rows = Array.from({ length: count }, (_, index) => ({
+    label: labels[index] ?? "",
+    value: values[index] ?? 0,
+  }));
+  const write = (next: { label: string; value: number }[]) => {
+    onChange(
+      next.map((row) => row.label),
+      next.map((row) => row.value)
+    );
+  };
+  return (
+    <div className="vik-chart-edit">
+      {rows.map((row, index) => (
+        <label key={index}>
+          <input
+            value={row.label}
+            aria-label={`Label ${index + 1}`}
+            onPointerDown={stopEventPropagation}
+            onChange={(event) => {
+              const next = rows.slice();
+              next[index] = { ...row, label: event.target.value };
+              write(next);
+            }}
+          />
+          <input
+            value={String(row.value)}
+            aria-label={`Value ${index + 1}`}
+            inputMode="decimal"
+            onPointerDown={stopEventPropagation}
+            onChange={(event) => {
+              const next = rows.slice();
+              next[index] = { ...row, value: Number(event.target.value) || 0 };
+              write(next);
+            }}
+          />
+        </label>
+      ))}
+      <button type="button" onPointerDown={stopEventPropagation} onClick={() => write([...rows, { label: "", value: 0 }])}>
+        Add row
+      </button>
     </div>
   );
 }
 
-function Frame({
+export function Frame({
   title,
   hint,
   onDrag,
+  onRename,
+  extra,
+  className,
+  onDragOver,
+  onDrop,
   children,
 }: {
   title: string;
   hint: string;
   onDrag: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  onRename?: (value: string) => void;
+  extra?: ReactNode;
+  className?: string;
+  onDragOver?: (event: ReactDragEvent<HTMLDivElement>) => void;
+  onDrop?: (event: ReactDragEvent<HTMLDivElement>) => void;
   children: React.ReactNode;
 }) {
+  const selecting = useAccelHeld();
   return (
-    <div className="vik-embed-frame">
+    <div
+      className={`vik-embed-frame${selecting ? " is-selecting" : ""}${className ? ` ${className}` : ""}`}
+      onDragOver={onDragOver}
+      onDrop={onDrop}
+    >
       <div className="vik-map-bar" onPointerDown={onDrag}>
-        <span>{title}</span>
+        {onRename ? (
+          <input
+            className="vik-title-input"
+            value={title}
+            aria-label="Title"
+            onPointerDown={stopEventPropagation}
+            onChange={(event) => onRename(event.target.value)}
+          />
+        ) : (
+          <span>{title}</span>
+        )}
         <span className="vik-map-hint">{hint}</span>
+        {extra}
       </div>
-      <div className="vik-embed-body" onPointerDown={stopEventPropagation}>
+      <div className="vik-embed-body" onPointerDown={keepInteractive}>
         {children}
       </div>
     </div>
@@ -197,15 +394,50 @@ export class ChartShapeUtil extends BaseBoxShapeUtil<ChartShape> {
   }
 
   override component(shape: ChartShape) {
-    const editor = this.editor;
-    return (
-      <HTMLContainer>
-        <Frame title={shape.props.title || "Chart"} hint={shape.props.chart} onDrag={(event) => startDrag(editor, shape, event)}>
-          <ChartGraphic chart={shape.props.chart} labels={parseList(shape.props.labels)} values={parseNumbers(shape.props.values)} />
-        </Frame>
-      </HTMLContainer>
-    );
+    return <ChartBody editor={this.editor} shape={shape} />;
   }
+}
+
+function ChartBody({ editor, shape }: { editor: Editor; shape: ChartShape }) {
+  const [editing, setEditing] = useState(false);
+  const labels = parseList(shape.props.labels);
+  const values = parseNumbers(shape.props.values);
+  return (
+    <HTMLContainer>
+      <Frame
+        title={shape.props.title || "Chart"}
+        hint={shape.props.chart}
+        onDrag={(event) => startShapeDrag(editor, shape, event)}
+        onRename={(title) => editor.updateShape({ id: shape.id, type: CHART_TYPE, props: { title } })}
+        extra={
+          <button
+            type="button"
+            className="vik-edit-toggle"
+            onPointerDown={stopEventPropagation}
+            onClick={() => setEditing((value) => !value)}
+          >
+            {editing ? "Chart" : "Edit"}
+          </button>
+        }
+      >
+        {editing ? (
+          <ChartDataEditor
+            labels={labels}
+            values={values}
+            onChange={(nextLabels, nextValues) =>
+              editor.updateShape({
+                id: shape.id,
+                type: CHART_TYPE,
+                props: { labels: JSON.stringify(nextLabels), values: JSON.stringify(nextValues) },
+              })
+            }
+          />
+        ) : (
+          <ChartGraphic chart={shape.props.chart} labels={labels} values={values} />
+        )}
+      </Frame>
+    </HTMLContainer>
+  );
 }
 
 export class DocShapeUtil extends BaseBoxShapeUtil<DocShape> {
@@ -232,8 +464,16 @@ export class DocShapeUtil extends BaseBoxShapeUtil<DocShape> {
     const editor = this.editor;
     return (
       <HTMLContainer>
-        <Frame title={shape.props.title || "Note"} hint={shape.props.format === "md" ? "markdown" : "text"} onDrag={(event) => startDrag(editor, shape, event)}>
-          <DocBody format={shape.props.format} body={shape.props.body} />
+        <Frame
+          title={shape.props.title || "Note"}
+          hint={shape.props.format === "md" ? "markdown" : "text"}
+          onDrag={(event) => startShapeDrag(editor, shape, event)}
+          onRename={(title) => editor.updateShape({ id: shape.id, type: DOC_TYPE, props: { title } })}
+        >
+          <DocBody
+            body={shape.props.body}
+            onChange={(body) => editor.updateShape({ id: shape.id, type: DOC_TYPE, props: { body } })}
+          />
         </Frame>
       </HTMLContainer>
     );
@@ -273,7 +513,12 @@ export class SheetShapeUtil extends BaseBoxShapeUtil<SheetShape> {
     };
     return (
       <HTMLContainer>
-        <Frame title={shape.props.title || "Sheet"} hint="sheet" onDrag={(event) => startDrag(editor, shape, event)}>
+        <Frame
+          title={shape.props.title || "Sheet"}
+          hint="sheet"
+          onDrag={(event) => startShapeDrag(editor, shape, event)}
+          onRename={(title) => editor.updateShape({ id: shape.id, type: SHEET_TYPE, props: { title } })}
+        >
           <div className="vik-sheet-wrap">
             <table className="vik-sheet">
               <thead>
@@ -282,6 +527,7 @@ export class SheetShapeUtil extends BaseBoxShapeUtil<SheetShape> {
                     <th key={index}>
                       <input
                         value={column}
+                        onPointerDown={stopEventPropagation}
                         onChange={(event) => {
                           const next = columns.slice();
                           next[index] = event.target.value;
@@ -299,6 +545,7 @@ export class SheetShapeUtil extends BaseBoxShapeUtil<SheetShape> {
                       <td key={columnIndex}>
                         <input
                           value={row[columnIndex] ?? ""}
+                          onPointerDown={stopEventPropagation}
                           onChange={(event) => {
                             const next = rows.map((cells) => cells.slice());
                             next[rowIndex][columnIndex] = event.target.value;
@@ -318,72 +565,75 @@ export class SheetShapeUtil extends BaseBoxShapeUtil<SheetShape> {
   }
 }
 
-async function uploadFile(file: File): Promise<{ fileId: string; name: string; preview: string }> {
-  const bytes = new Uint8Array(await file.arrayBuffer());
-  let binary = "";
-  const chunk = 0x8000;
-  for (let index = 0; index < bytes.length; index += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(index, index + chunk));
-  }
-  const response = await fetch("/api/canvas/files", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: file.name, data_b64: btoa(binary) }),
-  });
-  if (!response.ok) throw new Error(await response.text());
-  return response.json();
+async function uploadFile(file: File): Promise<{ fileId: string; name: string; preview: string; kind?: string }> {
+  return uploadFileWithProgress(file, () => {});
 }
 
-export async function placeDroppedFile(editor: Editor, file: File, point: { x: number; y: number }, shapeId?: TLShapeId) {
-  const saved = await uploadFile(file);
-  const lower = file.name.toLowerCase();
-  if (shapeId) {
-    editor.updateShape({
-      id: shapeId,
-      type: FILE_TYPE,
-      props: { name: saved.name, fileId: saved.fileId, preview: saved.preview },
-    });
-    return;
-  }
-  if (lower.endsWith(".csv")) {
-    const lines = saved.preview.split(/\r?\n/).filter(Boolean);
-    const columns = (lines[0] ?? "A,B").split(",");
-    const rows = lines.slice(1, 40).map((line) => line.split(","));
-    editor.createShape({
-      type: SHEET_TYPE,
-      x: point.x,
-      y: point.y,
-      props: {
-        w: 560,
-        h: 300,
-        title: saved.name,
-        columns: JSON.stringify(columns),
-        rows: JSON.stringify(rows.length ? rows : [columns.map(() => "")]),
-      },
-    });
-    return;
-  }
-  if (lower.endsWith(".md") || lower.endsWith(".txt")) {
-    editor.createShape({
-      type: DOC_TYPE,
-      x: point.x,
-      y: point.y,
-      props: {
-        w: 420,
-        h: 340,
-        title: saved.name,
-        format: lower.endsWith(".md") ? "md" : "text",
-        body: saved.preview,
-      },
-    });
-    return;
-  }
-  editor.createShape({
-    type: FILE_TYPE,
-    x: point.x,
-    y: point.y,
-    props: { w: 300, h: 220, name: saved.name, fileId: saved.fileId, preview: saved.preview },
+export function uploadFileWithProgress(
+  file: File,
+  onProgress: (pct: number) => void
+): Promise<{ fileId: string; name: string; preview: string; kind?: string }> {
+  return new Promise((resolve, reject) => {
+    void (async () => {
+      try {
+        onProgress(2);
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        onProgress(8);
+        let binary = "";
+        const chunk = 0x8000;
+        for (let index = 0; index < bytes.length; index += chunk) {
+          binary += String.fromCharCode(...bytes.subarray(index, index + chunk));
+        }
+        onProgress(12);
+        const body = JSON.stringify({ name: file.name, data_b64: btoa(binary) });
+        const xhr = new XMLHttpRequest();
+        xhr.upload.onprogress = (event) => {
+          if (!event.lengthComputable) return;
+          onProgress(12 + (event.loaded / event.total) * 86);
+        };
+        xhr.onerror = () => reject(new Error("Upload failed."));
+        xhr.onload = () => {
+          if (xhr.status < 200 || xhr.status >= 300) {
+            reject(new Error(xhr.responseText || `Upload failed (${xhr.status}).`));
+            return;
+          }
+          try {
+            onProgress(100);
+            resolve(JSON.parse(xhr.responseText));
+          } catch {
+            reject(new Error("Upload returned invalid JSON."));
+          }
+        };
+        xhr.open("POST", "/api/canvas/files");
+        xhr.setRequestHeader("Content-Type", "application/json");
+        xhr.send(body);
+      } catch (error) {
+        reject(error);
+      }
+    })();
   });
+}
+
+function UploadRing({ pct }: { pct: number }) {
+  const safe = Math.max(0, Math.min(100, pct));
+  const radius = 36;
+  const length = 2 * Math.PI * radius;
+  return (
+    <div className="vik-upload-ring" role="progressbar" aria-valuenow={safe} aria-valuemin={0} aria-valuemax={100}>
+      <svg viewBox="0 0 96 96" aria-hidden="true">
+        <circle cx="48" cy="48" r={radius} className="vik-upload-ring__track" />
+        <circle
+          cx="48"
+          cy="48"
+          r={radius}
+          className="vik-upload-ring__bar"
+          strokeDasharray={length}
+          strokeDashoffset={length * (1 - safe / 100)}
+        />
+      </svg>
+      <span>{safe}%</span>
+    </div>
+  );
 }
 
 export class FileShapeUtil extends BaseBoxShapeUtil<FileShape> {
@@ -394,10 +644,12 @@ export class FileShapeUtil extends BaseBoxShapeUtil<FileShape> {
     name: T.string,
     fileId: T.string,
     preview: T.string,
+    uploadPct: T.number,
+    kind: T.string,
   };
 
   override getDefaultProps(): FileShape["props"] {
-    return { w: 300, h: 220, name: "", fileId: "", preview: "" };
+    return { w: 300, h: 220, name: "", fileId: "", preview: "", uploadPct: 100, kind: "" };
   }
 
   override getIndicatorPath(shape: FileShape) {
@@ -408,31 +660,57 @@ export class FileShapeUtil extends BaseBoxShapeUtil<FileShape> {
 
   override component(shape: FileShape) {
     const editor = this.editor;
-    const onDrop = (event: React.DragEvent<HTMLDivElement>) => {
+    const onDrop = (event: ReactDragEvent<HTMLDivElement>) => {
       const file = event.dataTransfer.files?.[0];
       if (!file) return;
       event.preventDefault();
       event.stopPropagation();
-      void placeDroppedFile(editor, file, { x: shape.x, y: shape.y }, shape.id);
+      void import("./fileDrop").then((module) =>
+        module.placeDroppedFile(editor, file, { x: shape.x, y: shape.y }, shape.id)
+      );
     };
     return (
       <HTMLContainer>
-        <div className="vik-embed-frame vik-file-frame" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}>
-          <div className="vik-map-bar" onPointerDown={(event) => startDrag(editor, shape, event)}>
-            <span>{shape.props.name || "Drop a file"}</span>
-            <span className="vik-map-hint">file</span>
-          </div>
-          <div className="vik-embed-body" onPointerDown={stopEventPropagation}>
-            {shape.props.fileId ? (
-              <>
-                <p className="vik-file-path">inbox/{shape.props.fileId}</p>
-                <pre className="vik-file-preview">{shape.props.preview || "Stored. The agent can read it with Python."}</pre>
-              </>
-            ) : (
-              <p className="vik-empty">Drop a file here, or drop one anywhere on the canvas.</p>
-            )}
-          </div>
-        </div>
+        <Frame
+          className="vik-file-frame"
+          title={shape.props.name || "Drop a file"}
+          hint="file"
+          onDrag={(event) => startShapeDrag(editor, shape, event)}
+          onDragOver={(event) => event.preventDefault()}
+          onDrop={onDrop}
+        >
+          {shape.props.uploadPct >= 0 && shape.props.uploadPct < 100 ? (
+            <>
+              <p className="vik-file-path">{shape.props.name || "Uploading…"}</p>
+              <UploadRing pct={shape.props.uploadPct} />
+            </>
+          ) : shape.props.uploadPct < 0 ? (
+            <>
+              <p className="vik-file-path">{shape.props.name || "Upload failed"}</p>
+              <pre className="vik-file-preview">{shape.props.preview || "Could not upload this file."}</pre>
+            </>
+          ) : shape.props.fileId ? (
+            <>
+              <p className="vik-file-path">
+                inbox/{shape.props.fileId}
+                {shape.props.kind ? ` · ${shape.props.kind}` : ""}
+              </p>
+              {shape.props.kind === "image" ? (
+                <img
+                  className="vik-file-thumb"
+                  alt={shape.props.name || "Image file"}
+                  src={`/api/canvas/files/${encodeURIComponent(shape.props.fileId)}/raw`}
+                />
+              ) : (
+                <pre className="vik-file-preview">
+                  {shape.props.preview || "Stored. The agent can file-read or use python on it."}
+                </pre>
+              )}
+            </>
+          ) : (
+            <p className="vik-empty">Drop a file here, or drop one anywhere on the canvas.</p>
+          )}
+        </Frame>
       </HTMLContainer>
     );
   }

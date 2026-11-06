@@ -10,6 +10,8 @@ type Props = {
   categoryColors: Record<string, string>;
   onToggleLayer: (id: string) => void;
   boundsRef: RefObject<HTMLElement | null>;
+  allowDetach?: boolean;
+  onPull?: (phase: "start" | "move" | "end", x: number, y: number) => void;
 };
 
 const DEFAULT = { x: 12, y: 12 };
@@ -24,11 +26,14 @@ export function LayerIndexPanel({
   categoryColors,
   onToggleLayer,
   boundsRef,
+  allowDetach = false,
+  onPull,
 }: Props) {
   const activeCount = Object.values(layers).filter(Boolean).length;
   const panelRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState(DEFAULT);
   const [isDragging, setIsDragging] = useState(false);
+  const [handed, setHanded] = useState(false);
   const drag = useRef({
     active: false,
     pointerId: -1,
@@ -37,6 +42,7 @@ export function LayerIndexPanel({
     originX: 0,
     originY: 0,
     moved: false,
+    handed: false,
   });
 
   const clampPosition = useCallback((x: number, y: number) => {
@@ -74,7 +80,9 @@ export function LayerIndexPanel({
       originX: pos.x,
       originY: pos.y,
       moved: false,
+      handed: false,
     };
+    setHanded(false);
     setIsDragging(true);
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
   };
@@ -87,14 +95,36 @@ export function LayerIndexPanel({
       drag.current.moved = true;
     }
     if (!drag.current.moved) return;
+    const bounds = boundsRef.current?.getBoundingClientRect();
+    const outside =
+      allowDetach &&
+      bounds &&
+      (e.clientX < bounds.left || e.clientY < bounds.top || e.clientX > bounds.right || e.clientY > bounds.bottom);
+    if (outside) {
+      if (!drag.current.handed) {
+        drag.current.handed = true;
+        setHanded(true);
+        onPull?.("start", e.clientX, e.clientY);
+      } else {
+        onPull?.("move", e.clientX, e.clientY);
+      }
+      return;
+    }
+    if (drag.current.handed) {
+      onPull?.("move", e.clientX, e.clientY);
+      return;
+    }
     const next = clampPosition(drag.current.originX + dx, drag.current.originY + dy);
     setPos(next);
   };
 
   const onDragPointerUp = (e: React.PointerEvent) => {
     if (e.pointerId !== drag.current.pointerId) return;
+    const wasHanded = drag.current.handed;
     drag.current.active = false;
+    drag.current.handed = false;
     setIsDragging(false);
+    if (wasHanded) onPull?.("end", e.clientX, e.clientY);
     try {
       (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
     } catch {
@@ -115,7 +145,7 @@ export function LayerIndexPanel({
       ref={panelRef}
       className={`layer-float ${open ? "layer-float--open" : "layer-float--collapsed"} ${
         isDragging ? "layer-float--dragging" : ""
-      }`}
+      } ${handed ? "layer-float--handed" : ""}`}
       style={{ left: pos.x, top: pos.y }}
     >
       <div className="layer-float-head">
@@ -142,7 +172,9 @@ export function LayerIndexPanel({
       </div>
 
       <div className="layer-float-body">
-        <p className="layer-float-hint">Drag ⠿ to move · toggle layers below</p>
+        <p className="layer-float-hint">
+          {allowDetach ? "Drag ⠿ off the map · toggles still work" : "Drag ⠿ to move · toggle layers below"}
+        </p>
         <label className="layer-row layer-row--anim">
           <input
             type="checkbox"

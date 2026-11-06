@@ -6,10 +6,15 @@ Map-first civic analytics for Palghar (extendable). **LLM: cloud API** (`LLM_PRO
 
 ```
 viksetu/
-  backend/main.py       FastAPI — geo, spend, chat
+  backend/main.py       FastAPI — geo, spend, canvas agent, file tools
+  backend/llm.py        LLM client (gemini / textgen / ollama)
+  backend/agent_files.py  Workspace file-read helpers for the agent
+  canvas/               tldraw canvas + agent panel
   web/                  React + MapLibre dashboard
-  scripts/fetch_geo.py  OSM fetch + regions.json (seed fallback)
+  agent_workspace/      Agent sandbox (inbox/, scratch/, python cwd)
+  scripts/              Geo fetch, POI cards, probes
 data/geo/               GeoJSON layers + regions manifest
+data/palghar_2024_25/   Spend CSV and source PDFs
 ```
 
 ## Quick start

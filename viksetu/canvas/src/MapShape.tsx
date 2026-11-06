@@ -1,5 +1,5 @@
-import type { PointerEvent as ReactPointerEvent } from "react";
-import { BaseBoxShapeUtil, HTMLContainer, T, stopEventPropagation, type TLShape } from "tldraw";
+import { BaseBoxShapeUtil, HTMLContainer, T, type TLShape } from "tldraw";
+import { keepInteractive, startShapeDrag, useAccelHeld } from "./embedShapes";
 
 export const MAP_TYPE = "viksetu-map";
 export const MAP_URL = "http://127.0.0.1:5173/?embed=1";
@@ -34,59 +34,29 @@ export class MapShapeUtil extends BaseBoxShapeUtil<VikMapShape> {
   }
 
   override component(shape: VikMapShape) {
-    const editor = this.editor;
-    const onBarPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
-      if (event.button !== 0) return;
-      stopEventPropagation(event);
-      event.preventDefault();
-      const bar = event.currentTarget;
-      try {
-        bar.setPointerCapture(event.pointerId);
-      } catch {
-        // Synthetic or already-captured pointers still drag via the window listeners.
-      }
-      editor.setSelectedShapes([shape.id]);
-      const origin = editor.screenToPage({ x: event.clientX, y: event.clientY });
-      const start = { x: shape.x, y: shape.y, px: origin.x, py: origin.y };
-      const move = (ev: PointerEvent | MouseEvent) => {
-        const page = editor.screenToPage({ x: ev.clientX, y: ev.clientY });
-        editor.updateShape({
-          id: shape.id,
-          type: MAP_TYPE,
-          x: start.x + (page.x - start.px),
-          y: start.y + (page.y - start.py),
-        });
-      };
-      const up = () => {
-        window.removeEventListener("pointermove", move);
-        window.removeEventListener("pointerup", up);
-        window.removeEventListener("mousemove", move);
-        window.removeEventListener("mouseup", up);
-      };
-      window.addEventListener("pointermove", move);
-      window.addEventListener("pointerup", up);
-      window.addEventListener("mousemove", move);
-      window.addEventListener("mouseup", up);
-    };
-
-    return (
-      <HTMLContainer id={shape.id} className="vik-map-shape">
-        <div className="vik-map-frame is-live">
-          <div
-            className="vik-map-bar"
-            tabIndex={0}
-            aria-label="Drag Palghar map"
-            draggable={false}
-            onPointerDown={onBarPointerDown}
-          >
-            <span>Palghar map</span>
-            <span className="vik-map-hint">drag this bar to move</span>
-          </div>
-          <div className="vik-map-stage" onPointerDown={stopEventPropagation}>
-            <iframe title="Palghar district map" src={MAP_URL} draggable={false} />
-          </div>
-        </div>
-      </HTMLContainer>
-    );
+    return <MapBody editor={this.editor} shape={shape} />;
   }
+}
+
+function MapBody({ editor, shape }: { editor: MapShapeUtil["editor"]; shape: VikMapShape }) {
+  const selecting = useAccelHeld();
+  return (
+    <HTMLContainer id={shape.id} className="vik-map-shape">
+      <div className={`vik-map-frame is-live${selecting ? " is-selecting" : ""}`}>
+        <div
+          className="vik-map-bar"
+          tabIndex={0}
+          aria-label="Drag Palghar map"
+          draggable={false}
+          onPointerDown={(event) => startShapeDrag(editor, shape, event)}
+        >
+          <span>Palghar map</span>
+          <span className="vik-map-hint">drag this bar to move</span>
+        </div>
+        <div className="vik-map-stage" onPointerDown={keepInteractive}>
+          <iframe title="Palghar district map" src={MAP_URL} draggable={false} />
+        </div>
+      </div>
+    </HTMLContainer>
+  );
 }
