@@ -71,6 +71,31 @@ function loadView(): { center: [number, number]; zoom: number } | null {
   }
 }
 
+function coerceLayerVisible(value: unknown): boolean {
+  if (value === false || value === 0) return false;
+  if (typeof value === "string") {
+    const s = value.trim().toLowerCase();
+    if (s === "false" || s === "off" || s === "no" || s === "0") return false;
+    if (s === "true" || s === "on" || s === "yes" || s === "1") return true;
+  }
+  return Boolean(value);
+}
+
+function applyLayersToMap(map: Map | null, layerState: Record<string, boolean>) {
+  if (!map || !map.isStyleLoaded()) return;
+  for (const lid of LAYER_IDS) {
+    const circleId = `circle-${lid}`;
+    if (map.getLayer(circleId)) {
+      map.setLayoutProperty(circleId, "visibility", layerState[lid] ? "visible" : "none");
+    }
+  }
+  for (const lid of ["taluka-fill", "taluka-boundary"]) {
+    if (map.getLayer(lid)) {
+      map.setLayoutProperty(lid, "visibility", layerState.taluka_regions ? "visible" : "none");
+    }
+  }
+}
+
 function postMap(payload: Record<string, unknown>) {
   if (!EMBED || window.parent === window) return;
   window.parent.postMessage({ source: "viksetu-map", ...payload }, "*");
@@ -116,6 +141,36 @@ export default function App() {
     })),
   ];
 
+  const openPin = useCallback(async (
+    props: Record<string, string | number | undefined>,
+    layerId: string,
+    coordinates: [number, number]
+  ) => {
+    setCardLoading(true);
+    setSelectedCard(null);
+    const pinId = props.pin_id ? String(props.pin_id) : null;
+    let card: PoiCard | null = null;
+    try {
+      card = pinId ? await fetchPoiCard(pinId) : cardFromFeatureProps(props, layerId, coordinates);
+    } catch {
+      card = cardFromFeatureProps(props, layerId, coordinates);
+    } finally {
+      setSelectedCard(card);
+      setCardLoading(false);
+    }
+    postMap({
+      kind: "pin",
+      pinId: card?.pin_id ?? pinId ?? "",
+      name: card?.name ?? String(props.name ?? props.category_label ?? layerId),
+      layer: layerId,
+      lng: coordinates[0],
+      lat: coordinates[1],
+      summary: card?.agent_summary ?? "",
+      description: card?.description ?? "",
+    });
+    mapRef.current?.flyTo({ center: coordinates, zoom: Math.max(mapRef.current.getZoom(), 13) });
+  }, []);
+
   useEffect(() => {
     if (!EMBED) return;
     const onMessage = (event: MessageEvent) => {
@@ -123,6 +178,7 @@ export default function App() {
         source?: string;
         kind?: string;
         layer?: string;
+        layers?: Record<string, unknown>;
         visible?: boolean;
         pinId?: string;
         lng?: number;
@@ -130,8 +186,25 @@ export default function App() {
         zoom?: number;
       };
       if (!data || data.source !== "viksetu-canvas") return;
+      if (data.kind === "set-layers" && data.layers && typeof data.layers === "object") {
+        const patch = data.layers as Record<string, unknown>;
+        setLayers((prev) => {
+          const next = { ...prev };
+          for (const [key, value] of Object.entries(patch)) {
+            next[key] = coerceLayerVisible(value);
+          }
+          applyLayersToMap(mapRef.current, next);
+          return next;
+        });
+        return;
+      }
       if (data.kind === "set-layer" && data.layer) {
-        setLayers((prev) => ({ ...prev, [data.layer as string]: Boolean(data.visible) }));
+        const visible = coerceLayerVisible(data.visible);
+        setLayers((prev) => {
+          const next = { ...prev, [data.layer as string]: visible };
+          applyLayersToMap(mapRef.current, next);
+          return next;
+        });
         return;
       }
       if (data.kind === "focus-pin") {
@@ -162,41 +235,15 @@ export default function App() {
         void fetchPoiCard(data.pinId)
           .then((card) => setSelectedCard(card))
           .catch(() => undefined);
+        return;
+      }
+      if (data.kind === "resize") {
+        mapRef.current?.resize();
       }
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
   }, [openPin]);
-
-  const openPin = useCallback(async (
-    props: Record<string, string | number | undefined>,
-    layerId: string,
-    coordinates: [number, number]
-  ) => {
-    setCardLoading(true);
-    setSelectedCard(null);
-    const pinId = props.pin_id ? String(props.pin_id) : null;
-    let card: PoiCard | null = null;
-    try {
-      card = pinId ? await fetchPoiCard(pinId) : cardFromFeatureProps(props, layerId, coordinates);
-    } catch {
-      card = cardFromFeatureProps(props, layerId, coordinates);
-    } finally {
-      setSelectedCard(card);
-      setCardLoading(false);
-    }
-    postMap({
-      kind: "pin",
-      pinId: card?.pin_id ?? pinId ?? "",
-      name: card?.name ?? String(props.name ?? props.category_label ?? layerId),
-      layer: layerId,
-      lng: coordinates[0],
-      lat: coordinates[1],
-      summary: card?.agent_summary ?? "",
-      description: card?.description ?? "",
-    });
-    mapRef.current?.flyTo({ center: coordinates, zoom: Math.max(mapRef.current.getZoom(), 13) });
-  }, []);
 
   const addGeoLayer = useCallback(
     async (map: Map, layerId: string, visible: boolean) => {
@@ -445,19 +492,7 @@ export default function App() {
   }, [layers, loading]);
 
   useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !map.isStyleLoaded()) return;
-    for (const lid of LAYER_IDS) {
-      const circleId = `circle-${lid}`;
-      if (map.getLayer(circleId)) {
-        map.setLayoutProperty(circleId, "visibility", layers[lid] ? "visible" : "none");
-      }
-    }
-    for (const lid of ["taluka-fill", "taluka-boundary"]) {
-      if (map.getLayer(lid)) {
-        map.setLayoutProperty(lid, "visibility", layers.taluka_regions ? "visible" : "none");
-      }
-    }
+    applyLayersToMap(mapRef.current, layers);
   }, [layers]);
 
   const toggleLayer = (id: LayerId | "taluka_regions") => {

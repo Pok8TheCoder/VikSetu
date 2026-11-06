@@ -387,6 +387,13 @@ export class ChartShapeUtil extends BaseBoxShapeUtil<ChartShape> {
     return { w: 420, h: 280, title: "Chart", chart: "bar", labels: "[]", values: "[]" };
   }
 
+  override getText(shape: ChartShape) {
+    const labels = parseList(shape.props.labels);
+    const values = parseNumbers(shape.props.values);
+    const rows = labels.map((label, index) => `${label}\t${values[index] ?? ""}`);
+    return [shape.props.title, ...rows].filter((line) => line.trim()).join("\n") || "Chart";
+  }
+
   override getIndicatorPath(shape: ChartShape) {
     const path = new Path2D();
     path.rect(0, 0, shape.props.w, shape.props.h);
@@ -454,6 +461,10 @@ export class DocShapeUtil extends BaseBoxShapeUtil<DocShape> {
     return { w: 380, h: 320, title: "Note", format: "md", body: "" };
   }
 
+  override getText(shape: DocShape) {
+    return [shape.props.title, shape.props.body].filter((line) => line.trim()).join("\n\n") || "Note";
+  }
+
   override getIndicatorPath(shape: DocShape) {
     const path = new Path2D();
     path.rect(0, 0, shape.props.w, shape.props.h);
@@ -492,6 +503,13 @@ export class SheetShapeUtil extends BaseBoxShapeUtil<SheetShape> {
 
   override getDefaultProps(): SheetShape["props"] {
     return { w: 520, h: 280, title: "Sheet", columns: '["A","B"]', rows: '[["",""]]' };
+  }
+
+  override getText(shape: SheetShape) {
+    const columns = parseList(shape.props.columns);
+    const rows = parseRows(shape.props.rows);
+    const lines = [columns.join("\t"), ...rows.map((row) => row.join("\t"))].filter((line) => line.trim());
+    return [shape.props.title, ...lines].filter((line) => line.trim()).join("\n") || "Sheet";
   }
 
   override getIndicatorPath(shape: SheetShape) {
@@ -650,6 +668,10 @@ export class FileShapeUtil extends BaseBoxShapeUtil<FileShape> {
 
   override getDefaultProps(): FileShape["props"] {
     return { w: 300, h: 220, name: "", fileId: "", preview: "", uploadPct: 100, kind: "" };
+  }
+
+  override getText(shape: FileShape) {
+    return shape.props.name.trim() || shape.props.preview.trim() || "File";
   }
 
   override getIndicatorPath(shape: FileShape) {

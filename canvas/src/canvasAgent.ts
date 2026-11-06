@@ -98,6 +98,24 @@ export type FileToolNote = {
   preview?: string;
 };
 
+export type SubagentNote = {
+  ok?: boolean;
+  provider?: string;
+  model?: string;
+  fileId?: string;
+  question?: string;
+  answer?: string;
+  error?: string;
+};
+
+export type WebNote = {
+  ok?: boolean;
+  url?: string;
+  title?: string;
+  text?: string;
+  error?: string;
+};
+
 export type AgentTurn = {
   reply: string;
   actions: CanvasAction[];
@@ -106,6 +124,8 @@ export type AgentTurn = {
   continue?: boolean;
   python?: PythonNote[];
   file_tools?: FileToolNote[];
+  subagent?: SubagentNote[];
+  web?: WebNote[];
 };
 
 const GEOS = new Set(["rectangle", "ellipse", "diamond", "triangle", "hexagon"]);
@@ -370,12 +390,14 @@ export function applyActions(
         created.push(id);
       } else if (action.op === "map") {
         const spot = dropAt("map");
+        const x = typeof action.x === "number" ? action.x : spot.x;
+        const y = typeof action.y === "number" ? action.y : spot.y;
         const id = createShapeId();
         editor.createShape({
           id,
           type: MAP_TYPE,
-          x: spot.x,
-          y: spot.y,
+          x,
+          y,
           props: {
             w: action.w ?? 760,
             h: action.h ?? 520,

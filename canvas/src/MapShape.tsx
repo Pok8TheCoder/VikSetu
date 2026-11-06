@@ -1,5 +1,6 @@
 import { BaseBoxShapeUtil, HTMLContainer, T, type TLShape } from "tldraw";
 import { keepInteractive, startShapeDrag, useAccelHeld } from "./embedShapes";
+import { replayMapLayerState } from "./mapBridge";
 
 export const MAP_TYPE = "viksetu-map";
 export const MAP_URL = "http://127.0.0.1:5173/?embed=1";
@@ -21,6 +22,10 @@ export class MapShapeUtil extends BaseBoxShapeUtil<VikMapShape> {
 
   override getDefaultProps(): VikMapShape["props"] {
     return { w: 760, h: 520 };
+  }
+
+  override getText(_shape: VikMapShape) {
+    return "Palghar map";
   }
 
   override canEdit() {
@@ -54,7 +59,16 @@ function MapBody({ editor, shape }: { editor: MapShapeUtil["editor"]; shape: Vik
           <span className="vik-map-hint">drag this bar to move</span>
         </div>
         <div className="vik-map-stage" onPointerDown={keepInteractive}>
-          <iframe title="Palghar district map" src={MAP_URL} draggable={false} />
+          <iframe
+            title="Palghar district map"
+            src={MAP_URL}
+            draggable={false}
+            onLoad={(event) => {
+              const win = event.currentTarget.contentWindow;
+              win?.postMessage({ source: "viksetu-canvas", kind: "resize" }, "*");
+              window.setTimeout(() => replayMapLayerState(), 50);
+            }}
+          />
         </div>
       </div>
     </HTMLContainer>

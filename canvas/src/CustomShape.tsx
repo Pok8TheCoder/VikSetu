@@ -98,6 +98,11 @@ export class CustomShapeUtil extends BaseBoxShapeUtil<CustomShape> {
     return { w: 420, h: 300, title: "Embed", html: "", data: "" };
   }
 
+  override getText(shape: CustomShape) {
+    const plain = shape.props.html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    return [shape.props.title, plain].filter((line) => line.trim()).join("\n") || "Embed";
+  }
+
   override getIndicatorPath(shape: CustomShape) {
     const path = new Path2D();
     path.rect(0, 0, shape.props.w, shape.props.h);

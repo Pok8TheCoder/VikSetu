@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { Editor } from "@tldraw/editor";
 import {
   applyActions,
@@ -9,25 +9,27 @@ import {
   type CanvasAction,
   type FileToolNote,
   type PythonNote,
+  type SubagentNote,
+  type WebNote,
 } from "./canvasAgent";
 import { getChangeLog } from "./changeLog";
 import { getCursorPoint } from "./cursor";
 import { getMapContext } from "./mapContext";
-import { applyMapActions, splitMapActions } from "./mapBridge";
+import { applyMapActions, replayMapLayerState, splitMapActions } from "./mapBridge";
 
 const CHAT_KEY = "viksetu-canvas-chat";
 const STORE_KEY = "viksetu-canvas-chats";
 const AGENT_WIDTH_KEY = "viksetu-agent-width";
 const AGENT_OPEN_KEY = "viksetu-agent-open";
-const MAX_STEPS = 6;
-
 // One step is a thinking and action pair. It is shown in the chat but never sent with later prompts.
 type StepView = {
   thinking: string;
   note: string;
   actions: { label: string; detail: string }[];
   python: PythonNote[];
-  fileTools: FileToolNote[];
+  fileTools?: FileToolNote[];
+  subagent?: SubagentNote[];
+  web?: WebNote[];
   created: string[];
   error: string;
   live?: boolean;
@@ -65,6 +67,16 @@ function loadStore(): ChatStore {
         messages: (thread.messages || [INTRO]).slice(-40).map((message) => ({
           ...message,
           text: visibleText(message.text),
+          steps: message.steps?.map((step) => ({
+            ...step,
+            actions: step.actions ?? [],
+            python: step.python ?? [],
+            fileTools: step.fileTools ?? [],
+            subagent: step.subagent ?? [],
+            web: step.web ?? [],
+            created: step.created ?? [],
+            error: step.error ?? "",
+          })),
         })),
       }));
       const activeId = threads.some((thread) => thread.id === parsed.activeId) ? parsed.activeId : threads[0].id;
@@ -103,6 +115,8 @@ function asTurn(value: unknown): AgentTurn | null {
     continue?: unknown;
     python?: unknown;
     file_tools?: unknown;
+    subagent?: unknown;
+    web?: unknown;
   };
   if (typeof turn.reply !== "string" || !Array.isArray(turn.actions)) return null;
   const python = Array.isArray(turn.python)
@@ -111,6 +125,10 @@ function asTurn(value: unknown): AgentTurn | null {
   const fileTools = Array.isArray(turn.file_tools)
     ? turn.file_tools.filter((item) => item && typeof item === "object")
     : [];
+  const subagent = Array.isArray(turn.subagent)
+    ? turn.subagent.filter((item) => item && typeof item === "object")
+    : [];
+  const web = Array.isArray(turn.web) ? turn.web.filter((item) => item && typeof item === "object") : [];
   return {
     reply: visibleText(turn.reply),
     thinking: typeof turn.thinking === "string" ? turn.thinking : "",
@@ -119,6 +137,8 @@ function asTurn(value: unknown): AgentTurn | null {
     continue: turn.source === "llm" && Boolean(turn.continue),
     python: python as PythonNote[],
     file_tools: fileTools as FileToolNote[],
+    subagent: subagent as SubagentNote[],
+    web: web as WebNote[],
   };
 }
 
@@ -139,11 +159,16 @@ function liveThinking(raw: string): string {
   return [...tagged, written].filter(Boolean).join("\n\n");
 }
 
-async function streamTurn(body: unknown, onRaw: (raw: string) => void): Promise<AgentTurn | null> {
+async function streamTurn(
+  body: unknown,
+  onRaw: (raw: string) => void,
+  signal?: AbortSignal
+): Promise<AgentTurn | null> {
   const response = await fetch("/api/canvas/chat/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal,
   });
   if (!response.ok || !response.body) return null;
   const reader = response.body.getReader();
@@ -151,31 +176,79 @@ async function streamTurn(body: unknown, onRaw: (raw: string) => void): Promise<
   let buffer = "";
   let raw = "";
   let final: AgentTurn | null = null;
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let cut = buffer.indexOf("\n");
-    while (cut >= 0) {
-      const line = buffer.slice(0, cut).trim();
-      buffer = buffer.slice(cut + 1);
-      cut = buffer.indexOf("\n");
-      if (!line) continue;
-      let item: { type?: string; text?: string };
-      try {
-        item = JSON.parse(line);
-      } catch {
-        continue;
+  try {
+    for (;;) {
+      if (signal?.aborted) {
+        await reader.cancel();
+        throw new DOMException("Aborted", "AbortError");
       }
-      if (item.type === "delta") {
-        raw += item.text ?? "";
-        onRaw(raw);
-      } else if (item.type === "final") {
-        final = asTurn(item);
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let cut = buffer.indexOf("\n");
+      while (cut >= 0) {
+        const line = buffer.slice(0, cut).trim();
+        buffer = buffer.slice(cut + 1);
+        cut = buffer.indexOf("\n");
+        if (!line) continue;
+        let item: { type?: string; text?: string };
+        try {
+          item = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (item.type === "delta") {
+          raw += item.text ?? "";
+          onRaw(raw);
+        } else if (item.type === "final") {
+          final = asTurn(item);
+        }
       }
     }
+  } catch (error) {
+    if (signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) {
+      throw error;
+    }
+    return null;
   }
   return final;
+}
+
+function safeHref(href: string): string | null {
+  const value = href.trim();
+  if (value.startsWith("/") && !value.startsWith("//")) return value;
+  if (/^https?:\/\//i.test(value)) return value;
+  if (value.startsWith("subagent:")) return value;
+  return null;
+}
+
+function LinkedText({ text }: { text: string }) {
+  const nodes: ReactNode[] = [];
+  const pattern = /\[([^\]]+)\]\(([^)\s]+)\)/g;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text))) {
+    if (match.index > cursor) nodes.push(text.slice(cursor, match.index));
+    const href = safeHref(match[2]);
+    if (!href) {
+      nodes.push(match[0]);
+    } else if (href.startsWith("subagent:")) {
+      nodes.push(
+        <a key={match.index} href="#textgen" title="Local textgen sub-agent" onClick={(event) => event.preventDefault()}>
+          {match[1]}
+        </a>
+      );
+    } else {
+      nodes.push(
+        <a key={match.index} href={href} target="_blank" rel="noreferrer">
+          {match[1]}
+        </a>
+      );
+    }
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < text.length) nodes.push(text.slice(cursor));
+  return <>{nodes}</>;
 }
 
 function clipText(value: string, max: number): string {
@@ -195,7 +268,12 @@ function describeAction(action: CanvasAction): { label: string; detail: string }
 
 function StepPair({ step, index }: { step: StepView; index: number }) {
   const hasAction =
-    step.actions.length > 0 || step.python.length > 0 || step.fileTools.length > 0 || Boolean(step.error);
+    step.actions.length > 0 ||
+    step.python.length > 0 ||
+    (step.fileTools?.length ?? 0) > 0 ||
+    (step.subagent?.length ?? 0) > 0 ||
+    (step.web?.length ?? 0) > 0 ||
+    Boolean(step.error);
   return (
     <div className="agent-step">
       {step.thinking && (
@@ -212,10 +290,20 @@ function StepPair({ step, index }: { step: StepView; index: number }) {
           <summary>
             <span className="agent-fold__tag">Action</span>
             <span className="agent-fold__meta">
-              {[...step.actions.map((item) => item.label), ...step.python.map(() => "python"), ...step.fileTools.map((item) => item.mode || "file")].join(", ") || "failed"}
+              {[
+                ...step.actions.map((item) => item.label),
+                ...step.python.map(() => "python"),
+                ...(step.fileTools ?? []).map((item) => item.mode || "file"),
+                ...(step.subagent ?? []).map(() => "textgen vision"),
+                ...(step.web ?? []).map(() => "web"),
+              ].join(", ") || "failed"}
             </span>
           </summary>
-          {step.note && <p className="agent-fold__note">{step.note}</p>}
+          {step.note && (
+            <p className="agent-fold__note">
+              <LinkedText text={step.note} />
+            </p>
+          )}
           {step.actions.map((item, position) => (
             <div key={position} className="agent-fold__item">
               <strong>{item.label}</strong>
@@ -229,7 +317,29 @@ function StepPair({ step, index }: { step: StepView; index: number }) {
               {(note.stdout || note.stderr) && <pre>{clipText(`${note.stdout || ""}${note.stderr || ""}`, 1800)}</pre>}
             </div>
           ))}
-          {step.fileTools.map((note, position) => (
+          {(step.web ?? []).map((note, position) => (
+            <div key={`web-${position}`} className="agent-fold__item">
+              <strong>web · {note.ok ? note.title || note.url || "page" : "failed"}</strong>
+              {note.url && (
+                <p className="agent-fold__note">
+                  <a href={note.url} target="_blank" rel="noreferrer">
+                    {note.url}
+                  </a>
+                </p>
+              )}
+              <pre>{clipText(note.error || note.text || "", 1800)}</pre>
+            </div>
+          ))}
+          {(step.subagent ?? []).map((note, position) => (
+            <div key={`sub-${position}`} className="agent-fold__item">
+              <strong>
+                textgen · {note.fileId || "image"} · {note.ok ? "ok" : "failed"}
+              </strong>
+              {note.question && <p className="agent-fold__note">{note.question}</p>}
+              <pre>{clipText(note.error || note.answer || "", 1800)}</pre>
+            </div>
+          ))}
+          {(step.fileTools ?? []).map((note, position) => (
             <div key={`file-${position}`} className="agent-fold__item">
               <strong>
                 file · {note.mode || "read"} · {note.ok ? "ok" : "failed"}
@@ -268,6 +378,7 @@ export function AgentPanel({ editor }: Props) {
   const resizeRef = useRef<{ startX: number; startW: number } | null>(null);
   const [managing, setManaging] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
+  const runRef = useRef<{ abort: AbortController; stopped: boolean } | null>(null);
   const active = store.threads.find((thread) => thread.id === store.activeId) ?? store.threads[0];
   const messages = active?.messages ?? [INTRO];
 
@@ -338,6 +449,16 @@ export function AgentPanel({ editor }: Props) {
     });
   };
 
+  const stopRun = () => {
+    const run = runRef.current;
+    if (!run) return;
+    run.stopped = true;
+    run.abort.abort();
+    setProgress("Stopping…");
+  };
+
+  const isStopped = () => Boolean(runRef.current?.stopped || runRef.current?.abort.signal.aborted);
+
   const send = async () => {
     const text = draft.trim();
     if (!text || busy || !active) return;
@@ -346,10 +467,12 @@ export function AgentPanel({ editor }: Props) {
     const base: Message[] = [...messages, { role: "user" as const, text }];
     writeThread(threadId, base);
     setBusy(true);
+    const abort = new AbortController();
+    runRef.current = { abort, stopped: false };
     // Earlier prompts reach the model as the user text and the final reply only.
     const history = base
       .filter((item) => item.text.trim() && item.text !== INTRO.text)
-      .slice(-12)
+      .slice(-40)
       .map((item) => ({ role: item.role, text: item.text }));
     const steps: StepView[] = [];
     const trace: Record<string, unknown>[] = [];
@@ -361,7 +484,11 @@ export function AgentPanel({ editor }: Props) {
     let wantsMore = false;
     const show = (finalText: string) => writeThread(threadId, [...base, { role: "agent", text: finalText, steps: steps.slice() }]);
     try {
-      for (let step = 0; step < MAX_STEPS; step += 1) {
+      for (let step = 0; ; step += 1) {
+        if (isStopped()) {
+          notice = "Stopped.";
+          break;
+        }
         setProgress(step === 0 ? "Thinking…" : `Step ${step + 1}…`);
         const canvas = editor ? snapshotCanvas(editor) : [];
         let turn = planLocally(text, canvas);
@@ -388,26 +515,43 @@ export function AgentPanel({ editor }: Props) {
           };
           let parsed: AgentTurn | null = null;
           try {
-            parsed = await streamTurn(body, onRaw);
-          } catch {
+            parsed = await streamTurn(body, onRaw, abort.signal);
+          } catch (error) {
+            if (isStopped() || (error instanceof DOMException && error.name === "AbortError")) {
+              notice = "Stopped.";
+              break;
+            }
             parsed = null;
+          }
+          if (isStopped()) {
+            notice = "Stopped.";
+            break;
           }
           if (!parsed) {
             const response = await fetch("/api/canvas/chat", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify(body),
+              signal: abort.signal,
             });
             parsed = response.ok ? asTurn(await response.json()) : null;
           }
           setLive(null);
+          if (isStopped()) {
+            notice = "Stopped.";
+            break;
+          }
           if (parsed?.fromModel) {
             turn = parsed;
           } else if (step > 0) {
             notice = "The model stopped answering, so I stopped here.";
             break;
           }
-        } catch {
+        } catch (error) {
+          if (isStopped() || (error instanceof DOMException && error.name === "AbortError")) {
+            notice = "Stopped.";
+            break;
+          }
           if (step > 0) {
             notice = "The model stopped answering, so I stopped here.";
             break;
@@ -416,14 +560,12 @@ export function AgentPanel({ editor }: Props) {
         }
         let error = "";
         let createdNow: string[] = [];
+        if (isStopped()) {
+          notice = "Stopped.";
+          break;
+        }
         if (turn.actions.length) {
           const { map, canvas: canvasOps } = splitMapActions(turn.actions);
-          if (map.length) {
-            const mapResult = await applyMapActions(map);
-            if (mapResult.errors.length) {
-              error = [error, ...mapResult.errors].filter(Boolean).join("; ");
-            }
-          }
           if (editor && canvasOps.length) {
             try {
               const result = applyActions(editor, canvasOps, canvas, placed);
@@ -433,7 +575,16 @@ export function AgentPanel({ editor }: Props) {
               error = `Canvas update failed: ${String(failure)}`;
             }
           }
+          if (map.length) {
+            const mapResult = await applyMapActions(map);
+            if (mapResult.errors.length) {
+              error = [error, ...mapResult.errors].filter(Boolean).join("; ");
+            }
+          }
           applied.push(...turn.actions);
+        }
+        if (turn.actions.some((a) => a.op === "map-layer")) {
+          replayMapLayerState();
         }
         const python = (turn.python ?? []).map((note) => ({
           ...note,
@@ -447,12 +598,25 @@ export function AgentPanel({ editor }: Props) {
           dump: note.dump ? clipText(note.dump, 1200) : undefined,
           preview: note.preview ? clipText(note.preview, 1200) : undefined,
         }));
+        const subagent = (turn.subagent ?? []).map((note) => ({
+          ...note,
+          question: note.question ? clipText(note.question, 500) : undefined,
+          answer: note.answer ? clipText(note.answer, 1800) : undefined,
+          error: note.error ? clipText(note.error, 800) : undefined,
+        }));
+        const web = (turn.web ?? []).map((note) => ({
+          ...note,
+          text: note.text ? clipText(note.text, 1800) : undefined,
+          error: note.error ? clipText(note.error, 800) : undefined,
+        }));
         steps.push({
           thinking: clipText(turn.thinking ?? "", 6000),
           note: turn.reply,
           actions: turn.actions.map(describeAction),
           python,
           fileTools,
+          subagent,
+          web,
           created: createdNow,
           error,
         });
@@ -462,14 +626,25 @@ export function AgentPanel({ editor }: Props) {
           actions: turn.actions,
           python: turn.python ?? [],
           file_tools: turn.file_tools ?? [],
+          subagent: turn.subagent ?? [],
+          web: turn.web ?? [],
           created: createdNow,
           error,
         });
         lastReply = turn.reply;
         show("");
+        if (isStopped()) {
+          notice = "Stopped.";
+          break;
+        }
         wantsMore = Boolean(turn.continue && turn.fromModel);
         if (!wantsMore) break;
-        const produced = turn.actions.length > 0 || python.length > 0 || fileTools.length > 0;
+        const produced =
+          turn.actions.length > 0 ||
+          python.length > 0 ||
+          fileTools.length > 0 ||
+          (turn.subagent?.length ?? 0) > 0 ||
+          (turn.web?.length ?? 0) > 0;
         if (!produced) {
           if (stalled) break;
           stalled = true;
@@ -477,7 +652,6 @@ export function AgentPanel({ editor }: Props) {
           stalled = false;
         }
       }
-      if (wantsMore && steps.length >= MAX_STEPS) notice = `Stopped after ${MAX_STEPS} steps.`;
       if (editor) {
         const extra = ensureRequested(text, applied).filter((action) => !applied.some((done) => done.op === action.op));
         if (extra.length) {
@@ -494,7 +668,8 @@ export function AgentPanel({ editor }: Props) {
         }
       }
       const total = steps.reduce(
-        (sum, item) => sum + item.actions.length + item.python.length + item.fileTools.length,
+        (sum, item) =>
+          sum + item.actions.length + item.python.length + (item.fileTools?.length ?? 0) + (item.subagent?.length ?? 0) + (item.web?.length ?? 0),
         0
       );
       const finalText =
@@ -505,6 +680,7 @@ export function AgentPanel({ editor }: Props) {
     } catch (failure) {
       show(`${lastReply ? `${lastReply}\n\n` : ""}Something went wrong: ${String(failure)}`);
     } finally {
+      runRef.current = null;
       setLive(null);
       setBusy(false);
       setProgress("Thinking…");
@@ -531,7 +707,12 @@ export function AgentPanel({ editor }: Props) {
           <div className="agent-head-row">
             <h1>Agent</h1>
             <div className="agent-head-actions">
-              <button type="button" onClick={newChat}>
+              {busy && (
+                <button type="button" className="agent-stop-btn" onClick={stopRun}>
+                  Stop
+                </button>
+              )}
+              <button type="button" onClick={newChat} disabled={busy}>
                 New
               </button>
               <button type="button" aria-pressed={managing} onClick={() => setManaging((value) => !value)}>
@@ -565,7 +746,9 @@ export function AgentPanel({ editor }: Props) {
               <StepPair key={position} step={step} index={position} />
             ))}
             {message.text.trim() && (
-              <p className={`agent-msg agent-msg--${message.role}`}>{visibleText(message.text)}</p>
+              <p className={`agent-msg agent-msg--${message.role}`}>
+                <LinkedText text={visibleText(message.text)} />
+              </p>
             )}
           </div>
         ))}
@@ -592,6 +775,11 @@ export function AgentPanel({ editor }: Props) {
         <button type="submit" disabled={busy || !draft.trim()}>
           Send
         </button>
+        {busy && (
+          <button type="button" className="agent-stop-btn" onClick={stopRun}>
+            Stop
+          </button>
+        )}
       </form>
     </aside>
     </>

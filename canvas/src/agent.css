@@ -350,6 +350,11 @@ body,
   display: flex;
   flex-direction: column;
   gap: 0.55rem;
+  user-select: text;
+}
+
+.agent-log * {
+  user-select: text;
 }
 
 .agent-msg {
@@ -493,6 +498,13 @@ body,
   max-width: 96%;
   background: hsl(0, 0%, 100%, 6%);
   border: 1px solid hsl(240, 9%, 22%);
+}
+
+.agent-msg a,
+.agent-fold__note a {
+  color: hsl(199, 89%, 70%);
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .agent-msg--pending {
@@ -742,6 +754,11 @@ body,
   white-space: pre;
 }
 
+.tl-container .vik-embed-body,
+.tl-container .vik-embed-body * {
+  user-select: text;
+}
+
 .vik-embed-body {
   flex: 1;
   min-height: 0;
@@ -910,6 +927,49 @@ body,
 .agent-form button:disabled {
   opacity: 0.45;
   cursor: default;
+}
+
+.agent-stop-btn,
+.agent-head-actions .agent-stop-btn {
+  background: hsl(0, 72%, 46%) !important;
+  border: 1px solid hsl(0, 72%, 38%);
+}
+
+.agent-stop-btn:hover:not(:disabled) {
+  background: hsl(0, 72%, 40%) !important;
+}
+
+.canvas-fatal {
+  box-sizing: border-box;
+  min-height: 100%;
+  padding: 2rem;
+  background: hsl(240, 5%, 6.5%);
+  color: hsl(210, 17%, 98%);
+  font-family: "Segoe UI", system-ui, sans-serif;
+}
+
+.canvas-fatal h1 {
+  margin: 0 0 0.5rem;
+  font-size: 1.25rem;
+}
+
+.canvas-fatal pre {
+  white-space: pre-wrap;
+  background: hsl(240, 6%, 12%);
+  padding: 0.75rem;
+  border-radius: 8px;
+  font-size: 0.85rem;
+}
+
+.canvas-fatal button {
+  margin-top: 1rem;
+  padding: 0.5rem 1rem;
+  border: none;
+  border-radius: 8px;
+  background: hsl(214, 84%, 56%);
+  color: white;
+  font: inherit;
+  cursor: pointer;
 }
 
 @keyframes agent-in {

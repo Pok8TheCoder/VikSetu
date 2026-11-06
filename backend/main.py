@@ -4,19 +4,22 @@ from __future__ import annotations
 import base64
 import csv
 import json
+import math
 import os
 import re
 import subprocess
 import sys
+import urllib.parse
+from html.parser import HTMLParser
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 BACKEND_DIR = Path(__file__).resolve().parent
-ROOT = BACKEND_DIR.parents[1]
+ROOT = BACKEND_DIR.parent
 GEO = ROOT / "data" / "geo"
 SPEND_CSV = ROOT / "data" / "palghar_2024_25" / "derived" / "ps_sector_spend_2024_25.csv"
 WORK = ROOT / "agent_workspace"
@@ -24,6 +27,19 @@ INBOX = WORK / "inbox"
 SCRATCH = WORK / "scratch"
 INBOX.mkdir(parents=True, exist_ok=True)
 SCRATCH.mkdir(parents=True, exist_ok=True)
+
+
+def _load_dotenv() -> None:
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(ROOT / ".env")
+        load_dotenv(BACKEND_DIR / ".env")
+    except ImportError:
+        pass
+
+
+_load_dotenv()
 
 sys.path.insert(0, str(BACKEND_DIR))
 from agent_files import file_kind, run_file_action  # noqa: E402
@@ -55,7 +71,7 @@ def load_geojson(name: str) -> dict:
 
 @app.get("/api/health")
 def health():
-    provider = os.environ.get("LLM_PROVIDER", "gemini")
+    provider = os.environ.get("LLM_PROVIDER", "textgen")
     model = None
     vision = False
     try:
@@ -400,6 +416,87 @@ def _vision_images_from_canvas(req: CanvasChatRequest, limit: int = 4) -> list[s
     return urls
 
 
+def _image_data_url(path: Path) -> str:
+    import mimetypes
+
+    mime = mimetypes.guess_type(path.name)[0] or "image/png"
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def _canvas_image_ids(req: CanvasChatRequest) -> list[str]:
+    ids: list[str] = []
+    for shape in req.canvas or []:
+        if shape.get("type") != "viksetu-file":
+            continue
+        file_id = str(shape.get("fileId") or "").strip()
+        if not file_id:
+            continue
+        kind = str(shape.get("fileKind") or "")
+        try:
+            path = _inbox_file(file_id)
+        except HTTPException:
+            continue
+        if kind == "image" or path.suffix.lower() in IMAGE_SUFFIXES:
+            ids.append(file_id)
+    return ids
+
+
+def _run_vision_subagent(action: dict, req: CanvasChatRequest | None) -> dict:
+    """Ask the local textgen model to read an image. The lead model stays text-only."""
+    question = str(action.get("question") or action.get("prompt") or action.get("task") or "").strip()
+    if not question:
+        question = "Describe everything visible that would help answer the user, including text and numbers."
+    file_id = str(action.get("fileId") or "").strip()
+    images: list[str] = []
+    try:
+        if file_id:
+            path = _inbox_file(file_id)
+            if path.suffix.lower() not in IMAGE_SUFFIXES and file_kind(path) != "image":
+                return {"ok": False, "fileId": file_id, "question": question, "error": "That file is not an image."}
+            images = [_image_data_url(path)]
+        elif req is not None:
+            images = _vision_images_from_canvas(req, limit=2)
+            ids = _canvas_image_ids(req)
+            file_id = ids[0] if ids else ""
+        if not images:
+            return {
+                "ok": False,
+                "fileId": file_id,
+                "question": question,
+                "error": "No canvas image. Pass fileId of an image file on the canvas.",
+            }
+        from llm import chat, user_message_content
+
+        result = chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are the VikSetu vision sub-agent on the local text-generation-webui model. "
+                        "Answer only from the attached image. Quote visible text and numbers. "
+                        "If something is unreadable, say so. Do not invent."
+                    ),
+                },
+                {"role": "user", "content": user_message_content(question, images, vision=True)},
+            ],
+            provider="textgen",
+            temperature=0.1,
+            max_tokens=1200,
+            timeout=180,
+        )
+        return {
+            "ok": True,
+            "provider": "textgen",
+            "model": result.get("model"),
+            "fileId": file_id,
+            "question": question,
+            "answer": str(result.get("text") or "")[:4000],
+        }
+    except Exception as exc:
+        return {"ok": False, "fileId": file_id, "question": question, "error": str(exc)}
+
+
 def _split_file_tools(actions: list) -> tuple[list, list]:
     kept, notes = [], []
     for action in actions:
@@ -457,18 +554,22 @@ def _run_python(code: str) -> dict:
     target.write_text(script, encoding="utf-8")
     try:
         completed = subprocess.run(
-            [sys.executable, str(target)],
+            [sys.executable, "-X", "utf8", str(target)],
             cwd=str(WORK),
             capture_output=True,
-            text=True,
             timeout=45,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
         )
     except subprocess.TimeoutExpired:
         return {"ok": False, "stdout": "", "stderr": "Stopped after 45 seconds.", "code": 124}
+    except Exception as exc:
+        return {"ok": False, "stdout": "", "stderr": str(exc), "code": 1}
+    stdout = completed.stdout.decode("utf-8", "replace")
+    stderr = completed.stderr.decode("utf-8", "replace")
     return {
         "ok": completed.returncode == 0,
-        "stdout": completed.stdout[-8000:],
-        "stderr": completed.stderr[-4000:],
+        "stdout": stdout[-8000:],
+        "stderr": stderr[-4000:],
         "code": completed.returncode,
     }
 
@@ -527,6 +628,105 @@ def _chart_pairs(action: dict) -> tuple[list[str], list[float]]:
     return labels, values
 
 
+PIN_LAYERS = (
+    "government_school",
+    "health_facility",
+    "government_facility",
+    "community_poi",
+    "other_poi",
+    "development",
+)
+
+
+def _layer_visible(raw) -> bool:
+    if raw is False or raw == 0:
+        return False
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in ("false", "off", "no", "0"):
+            return False
+        if s in ("true", "on", "yes", "1"):
+            return True
+    return bool(raw)
+
+
+def _target_pin_layer_visibility(message: str) -> dict[str, bool] | None:
+    """When the user clearly wants a pin-layer preset, return visibility per PIN_LAYERS."""
+    lower = message.lower()
+    if not re.search(r"\b(map|layer|pin|poi)\b", lower):
+        return None
+    if not re.search(r"\b(enable|disable|show|hide|turn on|turn off|only|just)\b", lower):
+        return None
+
+    if re.search(r"\ball\b", lower) and re.search(r"\bpin", lower) and re.search(
+        r"\b(off|disabled|hide|disable|hidden)\b", lower
+    ):
+        return {layer: False for layer in PIN_LAYERS}
+
+    if "development" in lower and re.search(r"\b(only|just)\b", lower):
+        return {layer: layer == "development" for layer in PIN_LAYERS}
+    if re.search(r"\benabl(e|ing)\b", lower) and "development" in lower and re.search(
+        r"\bonly\b", lower
+    ):
+        return {layer: layer == "development" for layer in PIN_LAYERS}
+
+    aliases = {
+        "school": "government_school",
+        "schools": "government_school",
+        "health": "health_facility",
+        "govt": "government_facility",
+        "government": "government_facility",
+        "community": "community_poi",
+        "other": "other_poi",
+        "development": "development",
+        "works": "development",
+    }
+    for word, layer_id in aliases.items():
+        if re.search(rf"\b(only|just)\b.*\b{re.escape(word)}\b", lower) or re.search(
+            rf"\b{re.escape(word)}\b.*\bonly\b", lower
+        ):
+            return {layer: layer == layer_id for layer in PIN_LAYERS}
+
+    return None
+
+
+def _require_map_layer_actions(message: str, actions: list) -> tuple[list, bool]:
+    """
+    If the user asked for a layer preset, ensure map-layer ops exist.
+    Returns (actions, model_omitted_map_layer).
+    """
+    target = _target_pin_layer_visibility(message)
+    if not target:
+        return actions, False
+    model_layers = [
+        a for a in actions if isinstance(a, dict) and a.get("op") == "map-layer"
+    ]
+    kept = [a for a in actions if not (isinstance(a, dict) and a.get("op") == "map-layer")]
+    merged = dict(target)
+    for action in model_layers:
+        layer = str(action.get("layer") or "").strip()
+        if layer in merged:
+            merged[layer] = _layer_visible(action.get("visible"))
+    layer_actions = [{"op": "map-layer", "layer": layer, "visible": vis} for layer, vis in merged.items()]
+    omitted = len(model_layers) == 0
+    return kept + layer_actions, omitted
+
+
+def _normalize_map_layer_actions(actions: list) -> list:
+    pin_layers = set(PIN_LAYERS)
+
+    out = []
+    for action in actions:
+        if not isinstance(action, dict) or action.get("op") != "map-layer":
+            out.append(action)
+            continue
+        layer = str(action.get("layer") or "").strip()
+        if layer in pin_layers or layer == "taluka_regions":
+            action = {**action, "layer": layer, "visible": _layer_visible(action.get("visible"))}
+        out.append(action)
+    return out
+
+
 def _hydrate_actions(actions: list, message: str) -> list:
     spend = _spend_brief()
     known = {str(row.get("sector") or "").lower(): _num(row.get("actual_spend_inr")) for row in spend}
@@ -537,7 +737,10 @@ def _hydrate_actions(actions: list, message: str) -> list:
             continue
         labels, values = _chart_pairs(action)
         topic = f"{message} {action.get('title') or ''}".lower()
+        about_land = any(word in topic for word in ("land", "area", "taluka", "region share", "land mass"))
         about_spend = any(word in topic for word in ("spend", "sector", "budget", "expenditure", "outlay"))
+        if about_land:
+            about_spend = False
         named = sum(1 for label in labels if label.lower() in known)
         if (not any(values)) and (about_spend or named >= 2) and spend:
             if named >= 2:
@@ -567,10 +770,205 @@ def _split_python(actions: list) -> tuple[list, list]:
     return kept, notes
 
 
-def _split_agent_tools(actions: list) -> tuple[list, list, list]:
+def _split_subagent(actions: list, req: CanvasChatRequest | None) -> tuple[list, list]:
+    kept, notes = [], []
+    for action in actions:
+        if isinstance(action, dict) and str(action.get("op") or "") in {"vision", "subagent"}:
+            notes.append(_run_vision_subagent(action, req))
+        else:
+            kept.append(action)
+    return kept, notes
+
+
+class _PageText(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.title: list[str] = []
+        self._skip = 0
+        self._in_title = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"script", "style", "noscript", "svg"}:
+            self._skip += 1
+        if tag == "title":
+            self._in_title = True
+        if tag in {"p", "div", "br", "li", "h1", "h2", "h3", "tr", "section"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in {"script", "style", "noscript", "svg"} and self._skip:
+            self._skip -= 1
+        if tag == "title":
+            self._in_title = False
+
+    def handle_data(self, data):
+        if self._skip:
+            return
+        if self._in_title:
+            self.title.append(data)
+        text = " ".join(data.split())
+        if text:
+            self.parts.append(text + " ")
+
+
+def _html_to_text(raw: str) -> tuple[str, str]:
+    parser = _PageText()
+    try:
+        parser.feed(raw)
+        parser.close()
+    except Exception:
+        text = re.sub(r"<[^>]+>", " ", raw)
+        return "", re.sub(r"\s+", " ", text).strip()
+    title = " ".join(" ".join(parser.title).split())
+    text = re.sub(r"[ \t]+", " ", "".join(parser.parts))
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return title[:300], text
+
+
+def _ring_area_m2(ring) -> float:
+    if not ring or len(ring) < 4:
+        return 0.0
+    lat0 = sum(point[1] for point in ring) / len(ring)
+    kx = 111_320 * math.cos(math.radians(lat0))
+    ky = 110_540
+    area = 0.0
+    for index in range(len(ring) - 1):
+        x1, y1 = ring[index][0] * kx, ring[index][1] * ky
+        x2, y2 = ring[index + 1][0] * kx, ring[index + 1][1] * ky
+        area += x1 * y2 - x2 * y1
+    return abs(area) / 2
+
+
+def _geom_area_m2(geom: dict) -> float:
+    kind = geom.get("type")
+    coords = geom.get("coordinates") or []
+    if kind == "Polygon" and coords:
+        outer = _ring_area_m2(coords[0])
+        holes = sum(_ring_area_m2(ring) for ring in coords[1:])
+        return max(0.0, outer - holes)
+    if kind == "MultiPolygon":
+        return sum(_geom_area_m2({"type": "Polygon", "coordinates": poly}) for poly in coords)
+    return 0.0
+
+
+def _summarize_feature_collection(body: str) -> str | None:
+    """Turn a polygon FeatureCollection into name, km2, and percent so a chart can be built."""
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict) or data.get("type") != "FeatureCollection":
+        return None
+    features = data.get("features") or []
+    if not features or not isinstance(features[0], dict) or "geometry" not in features[0]:
+        return None
+    rows = []
+    for feature in features:
+        props = feature.get("properties") or {}
+        name = str(props.get("name") or props.get("id") or "unnamed")
+        km2 = _geom_area_m2(feature.get("geometry") or {}) / 1_000_000
+        if km2 <= 0:
+            continue
+        rows.append({"name": name, "km2": round(km2, 2)})
+    if not rows:
+        return None
+    total = sum(row["km2"] for row in rows) or 1
+    for row in rows:
+        row["percent"] = round(100 * row["km2"] / total, 2)
+    rows.sort(key=lambda row: row["percent"], reverse=True)
+    return json.dumps(
+        {
+            "summary": "Polygon areas derived from the GeoJSON. Use percent for a land-share pie chart.",
+            "feature_count": len(rows),
+            "total_km2": round(total, 2),
+            "areas": rows,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _fetch_web(action: dict) -> dict:
+    """GET a public page or this app's own API and return readable text."""
+    import urllib.error
+    import urllib.request
+
+    url = str(action.get("url") or action.get("href") or "").strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    elif url and "://" not in url:
+        url = "https://" + url
+    parsed = urllib.parse.urlparse(url) if url else None
+    if not parsed or parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return {"ok": False, "url": url, "error": "Pass an http or https URL."}
+    host = (parsed.hostname or "").lower()
+    if host in {"169.254.169.254", "metadata.google.internal"}:
+        return {"ok": False, "url": url, "error": "That host is blocked."}
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "VikSetuAgent/1.0", "Accept": "text/html,application/json,text/plain,*/*"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            final_url = resp.geturl()
+            content_type = resp.headers.get("Content-Type", "")
+            raw = resp.read(1_500_000)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(800).decode("utf-8", "replace")
+        return {"ok": False, "url": url, "error": f"HTTP {exc.code}: {detail[:400]}"}
+    except Exception as exc:
+        return {"ok": False, "url": url, "error": str(exc)}
+    charset = "utf-8"
+    match = re.search(r"charset=([\w.-]+)", content_type, flags=re.I)
+    if match:
+        charset = match.group(1)
+    body = raw.decode(charset, "replace")
+    if body.lstrip()[:1] in "{[":
+        summary = _summarize_feature_collection(body)
+        if summary:
+            return {
+                "ok": True,
+                "url": final_url or url,
+                "title": "GeoJSON area summary",
+                "content_type": "application/json",
+                "text": summary,
+            }
+    if "json" in content_type.lower() or body.lstrip()[:1] in "[{":
+        title, text = "", body.strip()
+    else:
+        title, text = _html_to_text(body)
+    text = text[:8000]
+    return {"ok": True, "url": final_url or url, "title": title, "content_type": content_type.split(";")[0], "text": text}
+
+
+def _split_web(actions: list) -> tuple[list, list]:
+    kept, notes = [], []
+    for action in actions:
+        if isinstance(action, dict) and str(action.get("op") or "") == "web":
+            notes.append(_fetch_web(action))
+        else:
+            kept.append(action)
+    return kept, notes
+
+
+def _user_wants_embed(message: str) -> bool:
+    lower = message.lower()
+    return bool(re.search(r"\b(embed|custom html|html widget|gauge|srcdoc)\b", lower))
+
+
+def _drop_unasked_embeds(message: str, actions: list) -> list:
+    if _user_wants_embed(message):
+        return actions
+    return [action for action in actions if not (isinstance(action, dict) and action.get("op") == "embed")]
+
+
+def _split_agent_tools(actions: list, req: CanvasChatRequest | None = None) -> tuple[list, list, list, list, list]:
     actions, file_notes = _split_file_tools(actions)
     actions, python_notes = _split_python(actions)
-    return actions, file_notes, python_notes
+    actions, sub_notes = _split_subagent(actions, req)
+    actions, web_notes = _split_web(actions)
+    return actions, file_notes, python_notes, sub_notes, web_notes
 
 
 @app.post("/api/canvas/files")
@@ -653,22 +1051,57 @@ def _parse_canvas_turn(text: str) -> dict:
     }
 
 
+CANVAS_MAX_TOKENS = int(os.environ.get("CANVAS_MAX_TOKENS", "4096"))
+CANVAS_CONTEXT_TOKENS = int(os.environ.get("CANVAS_CONTEXT_TOKENS", "12000"))
+
 CANVAS_SYSTEM = (
     "You are the VikSetu canvas agent. You share one tldraw page with the user. "
+    "You have tools. A reply that only describes a change does not perform it. "
+    "Tools that run now and return on the next step (set continue true, then use the result): "
+    "python in agent_workspace; file-read and file-list; vision (local textgen reads an image); "
+    "web fetches any http(s) page or JSON API and returns its title and text. "
+    "Local data you can open with web instead of guessing: "
+    "http://127.0.0.1:8001/api/geo/talukas, http://127.0.0.1:8001/api/geo/district, "
+    "http://127.0.0.1:8001/api/geo/layers/{layerId}, http://127.0.0.1:8001/api/spend. "
+    "If one port fails, try the same path on port 8002. "
+    "Cite a fetched page with a markdown link to that exact URL. "
     "Every object in Canvas JSON has id, type, x, y, w, h (page position and size), text, detail, and selected. "
     "Selection JSON is exactly what the user currently has selected. When they say this, these, or the selection, use those ids. "
     "Use those coordinates and sizes when you place or refer to an object. "
     "Map JSON lists layerStats (id, enabled, totalPins, visiblePins), enabled pins with layerEnabled true, "
     "hiddenPinSamples for pins on disabled layers (layerEnabled false), and the selected pin. "
     "Pin cards JSON has the full record for the selected pin and any pin the user named. "
-    "Use map-layer, map-focus, and map-pin to change the live map without placing a new map shape. "
+    "MAP TOOLS (mandatory for layer or pin visibility): The live map is changed only with map-layer, map-focus, and map-pin — not with reply text alone. "
+    "Pin layer ids (exact strings): government_school, health_facility, government_facility, community_poi, other_poi, development. "
+    "taluka_regions is boundary shading only, not POI pins. "
+    "When the user enables, disables, shows, hides, or says only/just one category, you MUST include one map-layer action per pin layer in the same step, "
+    "each with visible true or false (JSON booleans, never strings). "
+    "Example — only development pins visible: "
+    '{"op":"map-layer","layer":"development","visible":true}, '
+    '{"op":"map-layer","layer":"government_school","visible":false}, '
+    '{"op":"map-layer","layer":"health_facility","visible":false}, '
+    '{"op":"map-layer","layer":"government_facility","visible":false}, '
+    '{"op":"map-layer","layer":"community_poi","visible":false}, '
+    '{"op":"map-layer","layer":"other_poi","visible":false}. '
+    "Never tell the user layers changed unless those map-layer entries are in actions. "
+    "Do not place a new {\"op\":\"map\"} shape if a viksetu-map already exists — use map-layer only. "
+    "map-focus flies the map; map-pin edits poi card text. "
+    "Do not create an embed object unless the user explicitly asks for an embed, custom HTML, a widget, or a gauge. "
+    "Charts, notes, sheets, maps, and files are not embeds. "
+    "You are the lead agent. A local text-generation-webui vision model is your sub-agent. "
+    "If this request does not include image bytes, you cannot see pixels. "
+    "To read an image, emit {\"op\":\"vision\",\"fileId\":\"<canvas fileId>\",\"question\":\"<what to extract>\"} and set continue to true. "
+    "The next step includes subagent[].answer from textgen. Use that text; do not invent what the image shows. "
+    "In reply, cite each fact with an inline markdown link to the source, in the same sentence. "
+    "Allowed link targets: /api/spend, /api/poi/card/{pinId}, /api/geo/layers/{layerId}, /api/canvas/files/{fileId}/raw, and subagent:textgen for a vision answer. "
+    "Example: Development spend is in the [FY 2024-25 extract](/api/spend). The label in the photo is from [textgen vision](subagent:textgen). "
     "Spend JSON is the real FY 2024-25 extract. Workspace files live in agent_workspace (inbox/, scratch/, any path you create). "
     "Canvas file objects use type viksetu-file with fileId, fileKind (image|text|binary), and name. Drop images on the canvas like any file; "
     "when selected and the model supports vision, image bytes are sent automatically (not via chat). "
     "Reply with JSON only, keys in this order: {\"thinking\": string, \"reply\": string, \"actions\": array, \"continue\": boolean}. "
     "thinking is your visible reasoning for this step, written before you act. "
     "On the first step, restate what the user wants and the plan. On later steps, say what the last result showed and what is next. "
-    "Keep it to a few sentences. actions may be empty. "
+    "Keep it to a few sentences. If the user asked for a map layer change or a new canvas object, actions must include the corresponding ops — reply text alone does nothing on the map. "
     "Work in steps like an IDE agent. Each response is one step: think, do the next concrete actions, then stop. "
     "Do one task at a time. If the user asks for several new things (map and chart, chart and note, two charts, etc.), "
     "never create more than one new map, chart, doc, sheet, embed, or file object in the same step. "
@@ -701,7 +1134,11 @@ CANVAS_SYSTEM = (
     "{\"op\":\"map-layer\",\"layer\":string,\"visible\":boolean}, "
     "{\"op\":\"map-focus\",\"pinId\":string} or {\"lng\":number,\"lat\":number,\"zoom\":number}, "
     "{\"op\":\"map-pin\",\"pinId\":string,\"name\":string,\"description\":string,\"agent_summary\":string} "
-    "(writes poi_overrides.json; omit fields you do not change). "
+    "(writes poi_overrides.json; omit fields you do not change), "
+    "{\"op\":\"vision\",\"fileId\":string,\"question\":string} "
+    "sends that canvas image to the local textgen vision sub-agent and returns its answer on the next step. "
+    "{\"op\":\"web\",\"url\":string} fetches that web page or JSON URL (public http(s), or this app on 127.0.0.1) "
+    "and returns title and text on the next step. Cite that url in the reply. "
     "When the user asks to add, place, create, or make a chart, note, sheet, map, or file, you must include that action. "
     "Cursor JSON is the page point under the pointer, or the last known point. New objects are placed just below it; you may omit x and y. "
     "Pass id on chart, doc, sheet, or embed to update that object instead of creating one. The user can also edit titles, notes, chart rows, and sheet cells. "
@@ -737,9 +1174,12 @@ def _canvas_context(req: CanvasChatRequest) -> str:
                     "Selected file shapes are sent first."
                 )
             else:
+                ids = ", ".join(_canvas_image_ids(req)[:4]) or "unknown"
                 vision_note = (
-                    f"{len(vision_images)} image file(s) on the canvas but {model} is text-only; "
-                    "use file-read or python on inbox/ instead."
+                    f"{len(vision_images)} image file(s) on the canvas ({ids}) but {model} is text-only. "
+                    "Call {\"op\":\"vision\",\"fileId\":\"<id>\",\"question\":\"...\"} so the textgen sub-agent can read the image. "
+                    "Cite its answer as [textgen vision](subagent:textgen) and the file as "
+                    "[file](/api/canvas/files/<fileId>/raw)."
                 )
         except Exception:
             vision_note = f"{len(vision_images)} image file(s) on the canvas."
@@ -760,6 +1200,9 @@ def _canvas_context(req: CanvasChatRequest) -> str:
             "Pin cards JSON:\n" + json.dumps(_pin_cards_for(req.map or {}, req.message), ensure_ascii=False),
             "Spend JSON:\n" + json.dumps(_spend_brief(), ensure_ascii=False),
             "Workspace files:\n" + json.dumps(_workspace_files(), ensure_ascii=False),
+            "Cite sources in reply with markdown links. Spend: /api/spend. "
+            "Pin card: /api/poi/card/{pinId}. Layer: /api/geo/layers/{layerId}. "
+            "Inbox file: /api/canvas/files/{fileId}/raw. Vision sub-agent: subagent:textgen.",
         ]
     if vision_note:
         parts.insert(0, vision_note)
@@ -775,7 +1218,7 @@ def _canvas_messages(req: CanvasChatRequest) -> list[dict]:
     # Earlier prompts contribute only the user text and the final reply. Their thinking and actions are not sent.
     history = [
         item
-        for item in req.history[-12:]
+        for item in req.history
         if str(item.get("text") or "").strip()
     ]
     if not history or history[-1].get("role") != "user" or history[-1].get("text") != req.message:
@@ -847,6 +1290,28 @@ def _canvas_messages(req: CanvasChatRequest) -> list[dict]:
                 }
                 for note in (item.get("file_tools") or [])
             ],
+            "subagent": [
+                {
+                    "ok": note.get("ok"),
+                    "provider": note.get("provider") or "textgen",
+                    "model": note.get("model"),
+                    "fileId": note.get("fileId"),
+                    "question": note.get("question"),
+                    "answer": str(note.get("answer") or "")[:3000],
+                    "error": note.get("error"),
+                }
+                for note in (item.get("subagent") or [])
+            ],
+            "web": [
+                {
+                    "ok": note.get("ok"),
+                    "url": note.get("url"),
+                    "title": note.get("title"),
+                    "error": note.get("error"),
+                    "text": str(note.get("text") or "")[:2500],
+                }
+                for note in (item.get("web") or [])
+            ],
         }
         content = "Result of your step " + str(index + 1) + ":\n" + json.dumps(result_note, ensure_ascii=False)[:6000]
         if index == len(steps) - 1:
@@ -858,7 +1323,101 @@ def _canvas_messages(req: CanvasChatRequest) -> list[dict]:
                 "Do not recreate objects that already exist."
             )
         messages.append({"role": "user", "content": content})
-    return messages
+    return _fit_context(messages)
+
+
+def _content_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        bits = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                bits.append(str(part.get("text") or ""))
+            elif isinstance(part, dict) and part.get("type") == "image_url":
+                bits.append("[image]")
+            else:
+                bits.append(str(part))
+        return "\n".join(bits)
+    return str(content or "")
+
+
+def _approx_tokens(content) -> int:
+    """Rough token count (~4 characters per token) plus a flat cost per image."""
+    images = 0
+    if isinstance(content, list):
+        images = sum(1 for part in content if isinstance(part, dict) and part.get("type") == "image_url")
+    return max(1, (len(_content_text(content)) + 3) // 4) + images * 256
+
+
+def _message_tokens(message: dict) -> int:
+    return _approx_tokens(message.get("content")) + 4
+
+
+def _clip_text(text: str, max_tokens: int) -> str:
+    max_chars = max(200, max_tokens * 4)
+    if len(text) <= max_chars:
+        return text
+    marker = "\n\n[…truncated to fit the context limit…]\n\n"
+    budget = max(80, max_chars - len(marker))
+    head = max(80, budget // 4)
+    tail = max(0, budget - head)
+    return text[:head] + marker + (text[-tail:] if tail else "")
+
+
+def _replace_text(content, new_text: str):
+    if not isinstance(content, list):
+        return new_text
+    replaced = False
+    out = []
+    for part in content:
+        if not replaced and isinstance(part, dict) and part.get("type") == "text":
+            out.append({**part, "text": new_text})
+            replaced = True
+        else:
+            out.append(part)
+    return out if replaced else new_text
+
+
+def _fit_context(messages: list[dict]) -> list[dict]:
+    """Keep the prompt within CANVAS_CONTEXT_TOKENS by dropping the oldest chat first."""
+    budget = CANVAS_CONTEXT_TOKENS
+
+    def total(msgs: list[dict]) -> int:
+        return sum(_message_tokens(item) for item in msgs)
+
+    if not messages or total(messages) <= budget:
+        return messages
+
+    system = dict(messages[0])
+    rest = [dict(item) for item in messages[1:]]
+    if not rest:
+        system["content"] = _clip_text(_content_text(system.get("content")), max(64, budget - 8))
+        return [system]
+
+    tail = [rest[-1]]
+    head = rest[:-1]
+    dropped = 0
+    while head and total([system, *head, *tail]) > budget:
+        head.pop(0)
+        dropped += 1
+    out = [system, *head, *tail]
+    if dropped:
+        out[0]["content"] = (
+            str(out[0].get("content") or "")
+            + f"\n\nEarlier chat turns were omitted because this request exceeded the {budget} token context limit."
+        )
+    while len(out) > 2 and total(out) > budget:
+        out.pop(1)
+    for _ in range(6):
+        if total(out) <= budget:
+            break
+        index = max(range(len(out)), key=lambda i: _message_tokens(out[i]))
+        overflow = total(out) - budget
+        target = max(64, _message_tokens(out[index]) - overflow - 8)
+        text = _clip_text(_content_text(out[index].get("content")), target)
+        out[index] = {**out[index], "content": _replace_text(out[index].get("content"), text)}
+    return out
 
 
 _PLACERS = frozenset({"map", "chart", "doc", "sheet", "embed", "file"})
@@ -885,8 +1444,16 @@ def _one_placer_per_step(actions: list) -> tuple[list, bool]:
 def _package_turn(req: CanvasChatRequest, text: str, provider, model) -> dict:
     turn = _parse_canvas_turn(text)
     hydrated = _hydrate_actions(turn["actions"], req.message)
-    actions, file_notes, python_notes = _split_agent_tools(hydrated)
+    actions, file_notes, python_notes, sub_notes, web_notes = _split_agent_tools(hydrated, req)
+    actions = _drop_unasked_embeds(req.message, actions)
+    actions, model_omitted_layers = _require_map_layer_actions(req.message, actions)
+    actions = _normalize_map_layer_actions(actions)
     actions, deferred = _one_placer_per_step(actions)
+    layer_tool_note = ""
+    if model_omitted_layers and _target_pin_layer_visibility(req.message):
+        layer_tool_note = (
+            " (Applied map-layer tools for your request; always emit map-layer actions yourself in future steps.)"
+        )
     for note in python_notes:
         note["stdout"] = str(note.get("stdout") or "")[-2500:]
         note["stderr"] = str(note.get("stderr") or "")[-800:]
@@ -895,14 +1462,16 @@ def _package_turn(req: CanvasChatRequest, text: str, provider, model) -> dict:
             if key in note and isinstance(note[key], str):
                 note[key] = note[key][:4000]
     asked = turn.get("continue")
-    carry_on = True if python_notes or file_notes or deferred else bool(asked)
+    carry_on = True if python_notes or file_notes or sub_notes or web_notes or deferred else bool(asked)
     return {
         "thinking": turn.get("thinking") or "",
-        "reply": turn["reply"],
+        "reply": turn["reply"] + layer_tool_note,
         "actions": actions,
         "continue": carry_on,
         "python": python_notes,
         "file_tools": file_notes,
+        "subagent": sub_notes,
+        "web": web_notes,
         "source": "llm",
         "provider": provider,
         "model": model,
@@ -925,21 +1494,26 @@ def canvas_chat(req: CanvasChatRequest):
     try:
         from llm import chat
 
-        result = chat(_canvas_messages(req), temperature=0.2, json_mode=True, timeout=120)
+        result = chat(_canvas_messages(req), temperature=0.2, json_mode=True, timeout=120, max_tokens=CANVAS_MAX_TOKENS)
         return _package_turn(req, result["text"], result.get("provider"), result.get("model"))
     except Exception as exc:
         return _error_turn(exc)
 
 
 @app.post("/api/canvas/chat/stream")
-def canvas_chat_stream(req: CanvasChatRequest):
+def canvas_chat_stream(req: CanvasChatRequest, request: Request):
     """Same turn as /api/canvas/chat, sent as lines of JSON: delta chunks while the model writes, then one final."""
 
     def events():
         try:
             from llm import chat_stream
 
-            for item in chat_stream(_canvas_messages(req), temperature=0.2, timeout=120):
+            for item in chat_stream(
+                _canvas_messages(req),
+                temperature=0.2,
+                timeout=120,
+                max_tokens=CANVAS_MAX_TOKENS,
+            ):
                 if item.get("done"):
                     final = _package_turn(req, item["text"], item.get("provider"), item.get("model"))
                     yield json.dumps({"type": "final", **final}, ensure_ascii=False) + "\n"

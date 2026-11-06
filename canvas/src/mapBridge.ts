@@ -2,6 +2,29 @@ import type { CanvasAction } from "./canvasAgent";
 
 const MAP_AGENT_OPS = new Set(["map-layer", "map-focus", "map-pin"]);
 
+/** POI circle layers on the Palghar map (not taluka_regions). */
+export const MAP_PIN_LAYERS = [
+  "government_school",
+  "health_facility",
+  "government_facility",
+  "community_poi",
+  "other_poi",
+  "development",
+] as const;
+
+export function coerceMapVisible(value: unknown): boolean {
+  if (value === false || value === 0) return false;
+  if (typeof value === "string") {
+    const s = value.trim().toLowerCase();
+    if (s === "false" || s === "off" || s === "no" || s === "0") return false;
+    if (s === "true" || s === "on" || s === "yes" || s === "1") return true;
+  }
+  return Boolean(value);
+}
+
+/** Last layer toggles from the agent — replayed when a new map iframe loads. */
+let layerOverrides: Record<string, boolean> = {};
+
 export function isMapAgentAction(action: CanvasAction): boolean {
   return MAP_AGENT_OPS.has(action.op);
 }
@@ -22,6 +45,11 @@ function postToMapFrames(payload: Record<string, unknown>) {
   }
 }
 
+export function replayMapLayerState() {
+  if (!Object.keys(layerOverrides).length) return;
+  postToMapFrames({ kind: "set-layers", layers: { ...layerOverrides } });
+}
+
 export async function applyMapActions(actions: CanvasAction[]): Promise<{ notes: string[]; errors: string[] }> {
   const notes: string[] = [];
   const errors: string[] = [];
@@ -32,8 +60,10 @@ export async function applyMapActions(actions: CanvasAction[]): Promise<{ notes:
         errors.push("map-layer missing layer id");
         continue;
       }
-      postToMapFrames({ kind: "set-layer", layer, visible: Boolean((action as { visible?: boolean }).visible) });
-      notes.push(`layer ${layer} → ${(action as { visible?: boolean }).visible ? "on" : "off"}`);
+      const visible = coerceMapVisible((action as { visible?: unknown }).visible);
+      layerOverrides[layer] = visible;
+      postToMapFrames({ kind: "set-layer", layer, visible });
+      notes.push(`layer ${layer} → ${visible ? "on" : "off"}`);
     } else if (action.op === "map-focus") {
       const raw = action as { pinId?: string; lng?: number; lat?: number; zoom?: number };
       postToMapFrames({

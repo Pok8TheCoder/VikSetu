@@ -1,7 +1,7 @@
 """
 Minimal LLM client for VikSetu (OpenAI-compatible /chat/completions).
 
-Backends: textgen, ollama, gemini — set LLM_PROVIDER.
+Backends: textgen, ollama, gemini, deepinfra — set LLM_PROVIDER.
 """
 
 import json
@@ -30,7 +30,18 @@ GEMINI_BASE = os.environ.get(
 )
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 
-DEFAULT_PROVIDER = os.environ.get("LLM_PROVIDER", "gemini").strip().lower()
+DEEPINFRA_BASE = os.environ.get(
+    "DEEPINFRA_BASE_URL",
+    "https://api.deepinfra.com/v1/openai",
+)
+DEEPINFRA_MODEL = os.environ.get(
+    "DEEPINFRA_MODEL",
+    "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+)
+DEEPINFRA_API_KEY = os.environ.get("DEEPINFRA_API_KEY", "").strip()
+DEEPINFRA_REASONING_EFFORT = os.environ.get("DEEPINFRA_REASONING_EFFORT", "high").strip().lower()
+
+DEFAULT_PROVIDER = os.environ.get("LLM_PROVIDER", "textgen").strip().lower()
 
 _textgen_loaded_model = None
 _TOKENS_USED = 0
@@ -105,9 +116,35 @@ def _endpoint(provider):
             {"Authorization": "Bearer " + key},
             GEMINI_MODEL,
         )
+    if provider == "deepinfra":
+        if not DEEPINFRA_API_KEY:
+            raise LLMError(
+                "DEEPINFRA_API_KEY is not set.\n"
+                "  Get a key at https://deepinfra.com/dash/api_keys and set DEEPINFRA_API_KEY."
+            )
+        return (
+            DEEPINFRA_BASE.rstrip("/") + "/chat/completions",
+            {"Authorization": "Bearer " + DEEPINFRA_API_KEY},
+            DEEPINFRA_MODEL,
+        )
     raise LLMError(
-        "Unknown provider %r. Use 'textgen', 'ollama', or 'gemini'." % provider
+        "Unknown provider %r. Use 'textgen', 'ollama', 'gemini', or 'deepinfra'." % provider
     )
+
+
+def _apply_deepinfra_thinking(payload, provider):
+    """DeepSeek on DeepInfra: thinking on by default (reasoning_effort high)."""
+    if provider != "deepinfra":
+        return
+    effort = DEEPINFRA_REASONING_EFFORT or "high"
+    if effort in {"none", "off", "disabled", "false", "0"}:
+        payload["reasoning_effort"] = "none"
+        payload["thinking"] = {"type": "disabled"}
+        return
+    if effort not in {"low", "high", "max"}:
+        effort = "high"
+    payload["reasoning_effort"] = effort
+    payload["thinking"] = {"type": "enabled"}
 
 
 def chat(messages, provider=None, model=None, temperature=0.0,
@@ -123,7 +160,8 @@ def chat(messages, provider=None, model=None, temperature=0.0,
     }
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
-    if json_mode and provider != "textgen":
+    _apply_deepinfra_thinking(payload, provider)
+    if json_mode and provider not in ("textgen",):
         payload["response_format"] = {"type": "json_object"}
 
     started = time.time()
@@ -157,8 +195,10 @@ def chat(messages, provider=None, model=None, temperature=0.0,
     latency = time.time() - started
 
     try:
-        text = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError):
+        message = data["choices"][0]["message"]
+        text = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+    except (KeyError, IndexError, AttributeError):
         raise LLMError(
             "Unexpected response shape from %s:\n%s"
             % (provider, json.dumps(data)[:600])
@@ -171,6 +211,7 @@ def chat(messages, provider=None, model=None, temperature=0.0,
 
     return {
         "text": (text or "").strip(),
+        "reasoning": (reasoning or "").strip() if isinstance(reasoning, str) else "",
         "provider": provider,
         "model": data.get("model", model),
         "latency_s": round(latency, 2),
@@ -197,6 +238,7 @@ def chat_stream(messages, provider=None, model=None, temperature=0.0,
     }
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
+    _apply_deepinfra_thinking(payload, provider)
 
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), method="POST")
     req.add_header("Content-Type", "application/json")
@@ -333,7 +375,14 @@ def which():
         return "textgen  model=%s  base=%s" % (model, TEXTGEN_BASE)
     if p == "ollama":
         return "ollama  model=%s  base=%s" % (OLLAMA_MODEL, OLLAMA_BASE)
-    return "gemini  model=%s  key=%s" % (
-        GEMINI_MODEL,
-        "set" if os.environ.get("GOOGLE_API_KEY") else "MISSING",
-    )
+    if p == "deepinfra":
+        return "deepinfra  model=%s  key=%s" % (
+            DEEPINFRA_MODEL,
+            "set" if DEEPINFRA_API_KEY else "MISSING",
+        )
+    if p == "gemini":
+        return "gemini  model=%s  key=%s" % (
+            GEMINI_MODEL,
+            "set" if os.environ.get("GOOGLE_API_KEY") else "MISSING",
+        )
+    return "textgen  model=%s  base=%s" % (TEXTGEN_MODEL or "(loaded in UI)", TEXTGEN_BASE)
